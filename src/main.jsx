@@ -5,6 +5,7 @@ import { useControls, button } from 'leva';
 
 import { PlayerController, setRendererDomElement } from './PlayerController.js';
 import { CameraController } from './CameraController.js';
+import { ClimbDebugVis } from './ClimbDebugVis.js';
 import { exportSkeletonGLB, loadCustomGeoGLB } from './SkeletonIO.js';
 
 // ───────────────────────────────────────────────
@@ -141,10 +142,58 @@ const groundMeshes = [ground]; // collect all walkable surfaces
   groundMeshes.push(step2);
 }
 
+// ── Climbable walls ──
+const wallMat = new THREE.MeshStandardMaterial({ color: 0x7c6f64, roughness: 0.75 });
+
+// Wall 1 – tall vertical wall facing +X
+{
+  const geo = new THREE.BoxGeometry(2, 8, 6);
+  const wall = new THREE.Mesh(geo, wallMat);
+  wall.position.set(14, 4, 0);
+  wall.castShadow = true;
+  wall.receiveShadow = true;
+  wall.userData.climbable = true;
+  scene.add(wall);
+  groundMeshes.push(wall);
+}
+
+// Wall 2 – L-shaped wall section (two boxes)
+{
+  const w1 = new THREE.Mesh(new THREE.BoxGeometry(2, 6, 8), wallMat.clone());
+  w1.position.set(-14, 3, 4);
+  w1.castShadow = true;
+  w1.receiveShadow = true;
+  w1.userData.climbable = true;
+  scene.add(w1);
+  groundMeshes.push(w1);
+
+  const w2 = new THREE.Mesh(new THREE.BoxGeometry(6, 6, 2), wallMat.clone());
+  w2.position.set(-11, 3, 8);
+  w2.castShadow = true;
+  w2.receiveShadow = true;
+  w2.userData.climbable = true;
+  scene.add(w2);
+  groundMeshes.push(w2);
+}
+
+// Wall 3 – angled wall (tilted ~30° from vertical)
+{
+  const geo = new THREE.BoxGeometry(2, 8, 6);
+  const wall = new THREE.Mesh(geo, wallMat.clone());
+  wall.position.set(8, 3, -8);
+  wall.rotation.z = 0.5; // ~30° tilt
+  wall.castShadow = true;
+  wall.receiveShadow = true;
+  wall.userData.climbable = true;
+  scene.add(wall);
+  groundMeshes.push(wall);
+}
+
 // ── Player + Camera controllers ──
 const player = new PlayerController(scene);
 player.setGroundMeshes(groundMeshes);
 const camCtrl = new CameraController(camera, player);
+const climbDebug = new ClimbDebugVis(scene);
 
 // ── Pointer lock on canvas click ──
 renderer.domElement.addEventListener('click', () => {
@@ -166,6 +215,7 @@ function animate() {
   const dt = Math.min(clock.getDelta(), 0.05);
 
   player.update(dt);
+  climbDebug.update(player.walk, player.mesh.position);
   camCtrl.update();
   renderer.render(scene, camera);
 }
@@ -182,6 +232,15 @@ const walk = player.walk;
 const LIMB_LABELS = ['Rear L', 'Rear R', 'Mid L', 'Mid R', 'Front L', 'Front R'];
 
 function LevaPanel() {
+  // ── Climb Debug Vis ──
+  const debug = useControls('Debug', {
+    'Climb Rays': { value: true },
+  });
+
+  useEffect(() => {
+    climbDebug.enabled = debug['Climb Rays'];
+  }, [debug['Climb Rays']]);
+
   // ── Camera ──
   const cameraOffset = useControls('Camera Offset', {
     X: { value: 0, min: -20, max: 20, step: 0.1 },
@@ -213,11 +272,11 @@ function LevaPanel() {
 
   // ── Gait ──
   const gait = useControls('Gait', {
-    'Stride Length':    { value: 0.60, min: 0.1, max: 3.0, step: 0.05 },
+    'Stride Length':    { value: 0.40, min: 0.1, max: 3.0, step: 0.05 },
     'Step Height':      { value: 0.30, min: 0.05, max: 1.5, step: 0.05 },
-    'Step Duration':    { value: 0.10, min: 0.05, max: 1.0, step: 0.01 },
-    'Phase Spread':     { value: 0.66, min: 0, max: 1, step: 0.01 },
-    'Phase Randomness': { value: 0.42, min: 0, max: 1, step: 0.01 },
+    'Step Duration':    { value: 0.05, min: 0.01, max: 1.0, step: 0.01 },
+    'Phase Spread':     { value: 0.0, min: 0, max: 1, step: 0.01 },
+    'Phase Randomness': { value: 0.1, min: 0, max: 1, step: 0.01 },
     'Idle Correction':  { value: 0.3,  min: 0.05, max: 2.0, step: 0.05 },
   });
 
@@ -285,7 +344,7 @@ function LevaPanel() {
 
   // ── Spine Height ──
   const body = useControls('Body', {
-    'Spine Height': { value: 0.45, min: 0.3, max: 5.0, step: 0.05 },
+    'Spine Height': { value: 0.1, min: 0.01, max: 5.0, step: 0.05 },
   });
 
   useEffect(() => {

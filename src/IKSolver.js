@@ -2,6 +2,9 @@ import * as THREE from 'three';
 
 const _v = new THREE.Vector3();
 const _proj = new THREE.Vector3();
+const _chainDir = new THREE.Vector3();
+const _bendNormal = new THREE.Vector3();
+const _bendDir = new THREE.Vector3();
 
 /**
  * 2-bone IK solver.
@@ -39,27 +42,27 @@ export function solve2BoneIK(root, target, lenA, lenB, poleHint, outJoint) {
   const angleA = Math.acos(THREE.MathUtils.clamp(cosA, -1, 1));
 
   // Direction from root → target (unit)
-  const chainDir = chain.clone().normalize();
+  _chainDir.copy(chain).normalize();
 
   // Build a bend-plane normal: cross of chain direction with pole hint
-  const bendNormal = new THREE.Vector3().crossVectors(chainDir, poleHint);
-  if (bendNormal.lengthSq() < 0.0001) {
+  _bendNormal.crossVectors(_chainDir, poleHint);
+  if (_bendNormal.lengthSq() < 0.0001) {
     // Pole hint is parallel to chain – pick an arbitrary perpendicular
-    bendNormal.crossVectors(chainDir, new THREE.Vector3(0, 0, 1));
-    if (bendNormal.lengthSq() < 0.0001) {
-      bendNormal.crossVectors(chainDir, new THREE.Vector3(1, 0, 0));
+    _bendNormal.crossVectors(_chainDir, _proj.set(0, 0, 1));
+    if (_bendNormal.lengthSq() < 0.0001) {
+      _bendNormal.crossVectors(_chainDir, _proj.set(1, 0, 0));
     }
   }
-  bendNormal.normalize();
+  _bendNormal.normalize();
 
   // The bend direction (perpendicular to chain, in the bend plane)
-  const bendDir = new THREE.Vector3().crossVectors(bendNormal, chainDir).normalize();
+  _bendDir.crossVectors(_bendNormal, _chainDir).normalize();
 
   // Joint position = root + lenA * ( cos(angleA) * chainDir + sin(angleA) * bendDir )
   const sinA = Math.sin(angleA);
   outJoint.copy(root)
-    .addScaledVector(chainDir, lenA * cosA)
-    .addScaledVector(bendDir, lenA * sinA);
+    .addScaledVector(_chainDir, lenA * cosA)
+    .addScaledVector(_bendDir, lenA * sinA);
 
   return reachable;
 }

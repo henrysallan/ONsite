@@ -2,9 +2,9 @@ import * as THREE from 'three';
 
 /**
  * Locked third-person camera.
- * Stays at a fixed offset behind the player, rotating with the player's yaw.
- * Pitch from the player controller tilts the camera up/down.
- * X/Y/Z offset, pan, tilt, and FOV are tunable via Leva.
+ * Follows the player, rotating with yaw and tilting with pitch.
+ * Maintains a world-relative horizon so the camera stays comfortable
+ * even when the body tilts on walls/slopes.
  */
 export class CameraController {
   /**
@@ -31,7 +31,8 @@ export class CameraController {
     const yaw = this.playerCtrl.yaw;
     const pitch = this.playerCtrl.pitch;
 
-    // Compute offset rotated by the player's yaw
+    // Compute offset rotated by the player's yaw (world-relative, not body-relative)
+    // This keeps the camera horizon stable when the body tilts on walls
     const offset = new THREE.Vector3(this.offsetX, this.offsetY, this.offsetZ);
     offset.applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
 
@@ -42,7 +43,7 @@ export class CameraController {
     const desiredPos = this.target.position.clone().add(offset);
     this.camera.position.copy(desiredPos);
 
-    // Look target: slightly above player centre, shifted forward by pitch
+    // Look target: slightly above player centre (world up, not body up)
     const lookTarget = this.target.position.clone();
     lookTarget.y += 1.2;
     this.camera.lookAt(lookTarget);

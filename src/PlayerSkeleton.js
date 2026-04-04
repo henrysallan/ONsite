@@ -20,6 +20,17 @@ import { solve2BoneIK } from './IKSolver.js';
 const BONE_RADIUS = 0.03;
 const BONE_SEGMENTS = 6;
 
+// Shared unit-height cylinder geometry for all default bone meshes (scaled at runtime)
+const _sharedBoneGeo = new THREE.CylinderGeometry(BONE_RADIUS, BONE_RADIUS, 1, BONE_SEGMENTS);
+
+// Reusable temporaries for per-frame updates
+const _boneDir = new THREE.Vector3();
+const _boneMid = new THREE.Vector3();
+const _boneUp  = new THREE.Vector3(0, 1, 0);
+const _poleHint = new THREE.Vector3();
+const _toFoot = new THREE.Vector3();
+const _knee = new THREE.Vector3();
+
 // Shared materials
 const spineMat  = new THREE.MeshStandardMaterial({ color: 0xe2e8f0 });
 const hipMat    = new THREE.MeshStandardMaterial({ color: 0x94a3b8 });
@@ -31,11 +42,11 @@ const footMat   = new THREE.MeshStandardMaterial({ color: 0xef4444 });
 function createBoneMesh(from, to, material) {
   const dir = new THREE.Vector3().subVectors(to, from);
   const length = dir.length();
-  const geo = new THREE.CylinderGeometry(BONE_RADIUS, BONE_RADIUS, length, BONE_SEGMENTS);
-  const mesh = new THREE.Mesh(geo, material);
+  const mesh = new THREE.Mesh(_sharedBoneGeo, material);
 
   const mid = new THREE.Vector3().addVectors(from, to).multiplyScalar(0.5);
   mesh.position.copy(mid);
+  mesh.scale.set(1, length, 1);
 
   const up = new THREE.Vector3(0, 1, 0);
   const quat = new THREE.Quaternion().setFromUnitVectors(up, dir.clone().normalize());
@@ -47,35 +58,31 @@ function createBoneMesh(from, to, material) {
 
 /** Reposition an existing bone mesh to span from → to (reuses geometry). */
 function updateBoneMesh(mesh, from, to) {
-  const dir = new THREE.Vector3().subVectors(to, from);
-  const length = dir.length();
+  _boneDir.subVectors(to, from);
+  const length = _boneDir.length();
 
   if (mesh.userData.customGeo) {
     // Custom geometry: origin is at "from", extends along local +Y.
-    // Scale Y to match current bone length vs original rest length.
     mesh.position.copy(from);
-    const up = new THREE.Vector3(0, 1, 0);
-    const dirN = dir.clone().normalize();
-    if (dirN.lengthSq() > 0.0001) {
-      mesh.quaternion.setFromUnitVectors(up, dirN);
+    _boneUp.set(0, 1, 0);
+    const dirSq = _boneDir.lengthSq();
+    if (dirSq > 0.0001) {
+      _boneDir.multiplyScalar(1 / Math.sqrt(dirSq));
+      mesh.quaternion.setFromUnitVectors(_boneUp, _boneDir);
     }
     const restLen = mesh.userData.restLength || length;
     mesh.scale.set(1, length / restLen, 1);
   } else {
-    // Default cylinder: origin at midpoint
-    const oldLen = mesh.geometry.parameters?.height ?? 1;
-    if (Math.abs(length - oldLen) > 0.001) {
-      mesh.geometry.dispose();
-      mesh.geometry = new THREE.CylinderGeometry(BONE_RADIUS, BONE_RADIUS, length, BONE_SEGMENTS);
-    }
+    // Default cylinder: shared unit-height geometry, scaled to match length
+    _boneMid.addVectors(from, to).multiplyScalar(0.5);
+    mesh.position.copy(_boneMid);
+    mesh.scale.set(1, length, 1);
 
-    const mid = new THREE.Vector3().addVectors(from, to).multiplyScalar(0.5);
-    mesh.position.copy(mid);
-
-    const up = new THREE.Vector3(0, 1, 0);
-    const dirN = dir.normalize();
-    if (dirN.lengthSq() > 0.0001) {
-      mesh.quaternion.setFromUnitVectors(up, dirN);
+    _boneUp.set(0, 1, 0);
+    const dirSq = _boneDir.lengthSq();
+    if (dirSq > 0.0001) {
+      _boneDir.multiplyScalar(1 / Math.sqrt(dirSq));
+      mesh.quaternion.setFromUnitVectors(_boneUp, _boneDir);
     }
   }
 }
@@ -114,8 +121,11 @@ export class PlayerSkeleton {
   }
 
   build() {
-    // Tear down
-    for (const m of this._boneMeshes) { this.group.remove(m); m.geometry.dispose(); }
+    // Tear down — only dispose non-shared geometry
+    for (const m of this._boneMeshes) {
+      this.group.remove(m);
+      if (m.geometry !== _sharedBoneGeo) m.geometry.dispose();
+    }
     for (const m of this._jointMeshes) { this.group.remove(m); m.geometry.dispose(); }
     this._boneMeshes = [];
     this._jointMeshes = [];
@@ -196,29 +206,28 @@ export class PlayerSkeleton {
     const root = this.nodes[ld.nodeIndex]; // spine node (local)
 
     // Pole hint: point outward from spine (+X for left, -X for right)
-    const poleHint = new THREE.Vector3(ld.side === 'L' ? 1 : -1, 1, 0).normalize();
+    _poleHint.set(ld.side === 'L' ? 1 : -1, 1, 0).normalize();
 
     const hipLen = this.hipLengths[limbIndex];
     const legLen = this.legLengths[limbIndex];
     const maxReach = (hipLen + legLen) * 0.98; // 98% to prevent full extension
 
     // Clamp foot target so the limb never stretches beyond max reach
-    const toFoot = new THREE.Vector3().subVectors(footPosLocal, root);
-    const dist = toFoot.length();
+    _toFoot.subVectors(footPosLocal, root);
+    const dist = _toFoot.length();
     if (dist > maxReach) {
-      toFoot.multiplyScalar(maxReach / dist);
-      footPosLocal.copy(root).add(toFoot);
+      _toFoot.multiplyScalar(maxReach / dist);
+      footPosLocal.copy(root).add(_toFoot);
     }
 
-    const knee = new THREE.Vector3();
-    solve2BoneIK(root, footPosLocal, hipLen, legLen, poleHint, knee);
+    solve2BoneIK(root, footPosLocal, hipLen, legLen, _poleHint, _knee);
 
     // Update bone meshes
-    updateBoneMesh(ld.hipBone.mesh, root, knee);
-    updateBoneMesh(ld.legBone.mesh, knee, footPosLocal);
+    updateBoneMesh(ld.hipBone.mesh, root, _knee);
+    updateBoneMesh(ld.legBone.mesh, _knee, footPosLocal);
 
     // Update joint spheres
-    ld.kneeJoint.position.copy(knee);
+    ld.kneeJoint.position.copy(_knee);
     ld.footJoint.position.copy(footPosLocal);
   }
 
@@ -241,7 +250,9 @@ export class PlayerSkeleton {
   }
 
   dispose() {
-    for (const m of this._boneMeshes) { m.geometry.dispose(); }
+    for (const m of this._boneMeshes) {
+      if (m.geometry !== _sharedBoneGeo) m.geometry.dispose();
+    }
     for (const m of this._jointMeshes) { m.geometry.dispose(); }
   }
 
@@ -257,7 +268,7 @@ export class PlayerSkeleton {
       // Remove old mesh
       const oldMesh = bone.mesh;
       this.group.remove(oldMesh);
-      oldMesh.geometry.dispose();
+      if (oldMesh.geometry !== _sharedBoneGeo) oldMesh.geometry.dispose();
 
       // Compute rest length from the current bone endpoints
       const restLen = new THREE.Vector3().subVectors(bone.to, bone.from).length();
