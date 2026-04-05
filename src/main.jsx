@@ -1,4 +1,11 @@
 import * as THREE from 'three';
+import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+
+// Patch Three.js so every BufferGeometry can build a BVH and every Mesh raycasts through it
+THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
+THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
+THREE.Mesh.prototype.raycast = acceleratedRaycast;
 import React, { useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import { useControls, button } from 'leva';
@@ -62,11 +69,13 @@ scene.add(grid);
 
 // ── Terrain: ramps and hills ──
 const terrainMat = new THREE.MeshStandardMaterial({ color: 0x8b7355, roughness: 0.85 });
+ground.geometry.computeBoundsTree();
 const groundMeshes = [ground]; // collect all walkable surfaces
 
 // Ramp 1 – gentle slope facing +Z
 {
   const geo = new THREE.BoxGeometry(4, 0.15, 8);
+  geo.computeBoundsTree();
   const ramp = new THREE.Mesh(geo, terrainMat);
   ramp.position.set(6, 0.8, 5);
   ramp.rotation.x = -0.2; // ~11°
@@ -79,6 +88,7 @@ const groundMeshes = [ground]; // collect all walkable surfaces
 // Ramp 2 – steeper slope facing -X
 {
   const geo = new THREE.BoxGeometry(10, 0.15, 4);
+  geo.computeBoundsTree();
   const ramp = new THREE.Mesh(geo, terrainMat);
   ramp.position.set(-8, 1.0, -3);
   ramp.rotation.z = 0.25; // ~14°
@@ -91,6 +101,7 @@ const groundMeshes = [ground]; // collect all walkable surfaces
 // Ramp 3 – wide gentle ramp facing +X
 {
   const geo = new THREE.BoxGeometry(12, 0.15, 6);
+  geo.computeBoundsTree();
   const ramp = new THREE.Mesh(geo, terrainMat);
   ramp.position.set(0, 0.5, -10);
   ramp.rotation.z = -0.12; // ~7°
@@ -115,6 +126,7 @@ const groundMeshes = [ground]; // collect all walkable surfaces
     posAttr.setZ(i, h * h); // quadratic falloff for smooth dome
   }
   geo.computeVertexNormals();
+  geo.computeBoundsTree();
   const hillMat = new THREE.MeshStandardMaterial({ color: 0x6b8e23, roughness: 0.9 });
   const hill = new THREE.Mesh(geo, hillMat);
   hill.rotation.x = -Math.PI / 2;
@@ -128,6 +140,7 @@ const groundMeshes = [ground]; // collect all walkable surfaces
 // Stepped platform – two flat boxes
 {
   const step1 = new THREE.Mesh(new THREE.BoxGeometry(4, 0.5, 4), terrainMat.clone());
+  step1.geometry.computeBoundsTree();
   step1.position.set(-6, 0.25, 8);
   step1.castShadow = true;
   step1.receiveShadow = true;
@@ -135,6 +148,7 @@ const groundMeshes = [ground]; // collect all walkable surfaces
   groundMeshes.push(step1);
 
   const step2 = new THREE.Mesh(new THREE.BoxGeometry(3, 1.0, 3), terrainMat.clone());
+  step2.geometry.computeBoundsTree();
   step2.position.set(-6, 0.5, 8);
   step2.castShadow = true;
   step2.receiveShadow = true;
@@ -148,6 +162,7 @@ const wallMat = new THREE.MeshStandardMaterial({ color: 0x7c6f64, roughness: 0.7
 // Wall 1 – tall vertical wall facing +X
 {
   const geo = new THREE.BoxGeometry(2, 8, 6);
+  geo.computeBoundsTree();
   const wall = new THREE.Mesh(geo, wallMat);
   wall.position.set(14, 4, 0);
   wall.castShadow = true;
@@ -160,6 +175,7 @@ const wallMat = new THREE.MeshStandardMaterial({ color: 0x7c6f64, roughness: 0.7
 // Wall 2 – L-shaped wall section (two boxes)
 {
   const w1 = new THREE.Mesh(new THREE.BoxGeometry(2, 6, 8), wallMat.clone());
+  w1.geometry.computeBoundsTree();
   w1.position.set(-14, 3, 4);
   w1.castShadow = true;
   w1.receiveShadow = true;
@@ -168,6 +184,7 @@ const wallMat = new THREE.MeshStandardMaterial({ color: 0x7c6f64, roughness: 0.7
   groundMeshes.push(w1);
 
   const w2 = new THREE.Mesh(new THREE.BoxGeometry(6, 6, 2), wallMat.clone());
+  w2.geometry.computeBoundsTree();
   w2.position.set(-11, 3, 8);
   w2.castShadow = true;
   w2.receiveShadow = true;
@@ -179,6 +196,7 @@ const wallMat = new THREE.MeshStandardMaterial({ color: 0x7c6f64, roughness: 0.7
 // Wall 3 – angled wall (tilted ~30° from vertical)
 {
   const geo = new THREE.BoxGeometry(2, 8, 6);
+  geo.computeBoundsTree();
   const wall = new THREE.Mesh(geo, wallMat.clone());
   wall.position.set(8, 3, -8);
   wall.rotation.z = 0.5; // ~30° tilt
@@ -187,6 +205,30 @@ const wallMat = new THREE.MeshStandardMaterial({ color: 0x7c6f64, roughness: 0.7
   wall.userData.climbable = true;
   scene.add(wall);
   groundMeshes.push(wall);
+}
+
+// ── Test block (loaded from GLB) ──
+{
+  const loader = new GLTFLoader();
+  loader.load('/testblock.glb', (gltf) => {
+    const model = gltf.scene;
+    model.position.set(0, 0, 5);
+    model.traverse((child) => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+        child.userData.climbable = true;
+        // Build BVH for fast trimesh raycasting on complex geometry
+        child.geometry.computeBoundsTree();
+        groundMeshes.push(child);
+      }
+    });
+    scene.add(model);
+    // Update player ground meshes now that the block is loaded
+    player.setGroundMeshes(groundMeshes);
+  }, undefined, (err) => {
+    console.error('Failed to load testblock.glb:', err);
+  });
 }
 
 // ── Player + Camera controllers ──

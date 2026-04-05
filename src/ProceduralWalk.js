@@ -36,12 +36,16 @@ const _hitsArray = [];  // reusable array for intersectObjects
 
 /** Raycast downward only (fast path for floor-walking).
  *  Rejects hits on non-floor surfaces (normal.y < 0.5) to avoid
- *  snapping to wall side-faces on thin geometry. */
-function getGroundY(x, z, groundMeshes, fallback = 0) {
+ *  snapping to wall side-faces on thin geometry.
+ *  @param {number|null} refY — if provided, cast from refY+5 instead of y=50.
+ *    This makes the query proximity-aware: it finds the ground nearest to the
+ *    player rather than the highest surface (e.g., an overhang above). */
+function getGroundY(x, z, groundMeshes, fallback = 0, refY = null) {
   if (!groundMeshes || groundMeshes.length === 0) return fallback;
-  _rayOrigin.set(x, 50, z);
+  const startY = refY !== null ? refY + 5 : 50;
+  _rayOrigin.set(x, startY, z);
   _raycaster.set(_rayOrigin, _tmpV.set(0, -1, 0));
-  _raycaster.far = Infinity;
+  _raycaster.far = refY !== null ? 15 : Infinity;
   _hitsArray.length = 0;
   _raycaster.intersectObjects(groundMeshes, false, _hitsArray);
   for (let i = 0; i < _hitsArray.length; i++) {
@@ -54,7 +58,9 @@ function getGroundY(x, z, groundMeshes, fallback = 0) {
 
 /**
  * Cast a single ray from origin along dir, return shared _hitResult or null.
- * Rejects backfaces (normal facing same way as ray).
+ * Iterates all hits to skip backfaces (normal facing same way as ray).
+ * This is critical when geometry overlaps — the first hit may be a backface
+ * (e.g., inside of a wall box), and the real surface is behind it.
  * WARNING: returned object is reused — copy values if you need to keep them.
  */
 function castSurface(origin, dir, meshes, maxDist) {
@@ -63,10 +69,10 @@ function castSurface(origin, dir, meshes, maxDist) {
   _raycaster.far = maxDist;
   _hitsArray.length = 0;
   _raycaster.intersectObjects(meshes, false, _hitsArray);
-  if (_hitsArray.length > 0) {
-    const h = _hitsArray[0];
+  for (let i = 0; i < _hitsArray.length; i++) {
+    const h = _hitsArray[i];
     _worldNormal.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
-    // Reject backfaces
+    // Accept front-faces only (normal opposes ray direction)
     if (_worldNormal.dot(dir) < 0) {
       _hitPoint.copy(h.point);
       _hitNormal.copy(_worldNormal);
@@ -107,16 +113,33 @@ function placeOnSurface(pos, groundMeshes, climbDir, climbing, fallbackY, spineC
       }
     }
 
-    // Fallback: try downward cast (foot may be at an edge/corner)
+    // Fallback 1: downward cast (foot at bottom edge or corner)
     _rayOrigin.set(pos.x, pos.y + 2, pos.z);
     const gHit = castSurface(_rayOrigin, _tmpV.set(0, -1, 0), groundMeshes, 4);
     if (gHit) {
       pos.copy(gHit.point).addScaledVector(gHit.normal, 0.02);
       return gHit.normal;
     }
+
+    // Fallback 2: upward cast (foot below a ledge on complex geometry)
+    _rayOrigin.set(pos.x, pos.y - 2, pos.z);
+    const uHit = castSurface(_rayOrigin, _tmpV.set(0, 1, 0), groundMeshes, 4);
+    if (uHit) {
+      pos.copy(uHit.point).addScaledVector(uHit.normal, 0.02);
+      return uHit.normal;
+    }
+
+    // Fallback 3: outward from wall (foot may have drifted behind surface)
+    _rayOrigin.copy(pos).addScaledVector(climbDir, 1.5);
+    _tmpV.copy(climbDir).negate();
+    const oHit = castSurface(_rayOrigin, _tmpV, groundMeshes, 3);
+    if (oHit) {
+      pos.copy(oHit.point).addScaledVector(oHit.normal, 0.02);
+      return oHit.normal;
+    }
   }
-  // Normal ground mode: downward ray
-  const gy = getGroundY(pos.x, pos.z, groundMeshes, NaN);
+  // Normal ground mode: downward ray (proximity-aware)
+  const gy = getGroundY(pos.x, pos.z, groundMeshes, NaN, fallbackY);
   if (!isNaN(gy)) {
     pos.y = gy;
     return _tmpV.set(0, 1, 0);
@@ -128,7 +151,7 @@ function placeOnSurface(pos, groundMeshes, climbDir, climbing, fallbackY, spineC
       const blend = i * 0.25;
       const tx = pos.x + (spineCenter.x - pos.x) * blend;
       const tz = pos.z + (spineCenter.z - pos.z) * blend;
-      const retryY = getGroundY(tx, tz, groundMeshes, NaN);
+      const retryY = getGroundY(tx, tz, groundMeshes, NaN, fallbackY);
       if (!isNaN(retryY)) {
         pos.x = tx;
         pos.z = tz;
@@ -145,6 +168,28 @@ function placeOnSurface(pos, groundMeshes, climbDir, climbing, fallbackY, spineC
 /** Parabolic arc height as a function of t ∈ [0,1]. Peak at t = 0.5. */
 function arcHeight(t, stepHeight) {
   return 4 * stepHeight * t * (1 - t);
+}
+
+/**
+ * Lightweight surface probe — returns true if a surface exists at `pos`,
+ * false if all casts miss. Does NOT modify pos (non-destructive).
+ * Used for look-ahead gait adaptation (Strategy 5).
+ */
+function probeSurfaceExists(pos, groundMeshes, climbDir, climbing) {
+  if (climbing && climbDir) {
+    // Into-wall cast
+    _rayOrigin.copy(pos).addScaledVector(climbDir, -1.5);
+    if (castSurface(_rayOrigin, climbDir, groundMeshes, 3)) return true;
+    // Downward fallback
+    _rayOrigin.set(pos.x, pos.y + 2, pos.z);
+    if (castSurface(_rayOrigin, _tmpV.set(0, -1, 0), groundMeshes, 4)) return true;
+    // Upward fallback
+    _rayOrigin.set(pos.x, pos.y - 2, pos.z);
+    if (castSurface(_rayOrigin, _tmpV.set(0, 1, 0), groundMeshes, 4)) return true;
+    return false;
+  }
+  // Ground mode: downward ray (proximity-aware — use pos.y as reference)
+  return !isNaN(getGroundY(pos.x, pos.z, groundMeshes, NaN, pos.y));
 }
 
 // Per-limb pseudo-random frequencies for the noise oscillator (irrational-ish)
@@ -229,13 +274,29 @@ export class ProceduralWalk {
     this._climbTime        = 0;           // seconds spent climbing (for transition gating)
     this._surfaceRightDist = 10;          // distance to surface edge (+bodyRight)
     this._surfaceLeftDist  = 10;          // distance to surface edge (-bodyRight)
+    this._maintainMissCount = 0;          // consecutive frames maintain probe missed
 
     // ── Movement input ──
     this.inputDir = new THREE.Vector3();
     this._smoothedInput = new THREE.Vector3(); // smoothed velocity for stride lead
     this._yaw = 0;
     this._movedDelta = new THREE.Vector3();
+
+    // ── Transition request (consumed by PlayerController each frame) ──
+    // When ProceduralWalk detects a surface change that needs orchestrated animation,
+    // it sets this instead of flipping `climbing` directly. PlayerController reads it,
+    // starts the FSM, then calls clearTransitionRequest().
+    // Shape: { type: 'wall_to_ground'|'wall_to_top', point, normal, climbNormal }
+    this._transitionRequest = null;
+
+    // ── Transition lock (set by PlayerController while FSM is active) ──
+    // Suppresses idle correction, surface probing, and drift steps that
+    // would fight the transition's forced foot placements.
+    this._inTransition = false;
   }
+
+  /** Called by PlayerController after consuming the transition request. */
+  clearTransitionRequest() { this._transitionRequest = null; }
 
   /** Rotate a home position into world frame. Uses body quaternion when climbing, yaw when on ground.
    *  Applies _hipScale uniformly to both lateral (X) and depth (Z) components. */
@@ -358,25 +419,35 @@ export class ProceduralWalk {
     this._wrappedEdge = false;
 
     // ── Climb detection / maintenance ──
-    {
+    // Skip if a transition request is already pending (PlayerController hasn't consumed it yet)
+    if (!this._transitionRequest) {
       const bodyPos = bodyGroup.position;
 
       if (this.climbing) {
         this._climbTime += dt;
 
-        // ── GROUND DISMOUNT: exit climb when moving downward near the floor ──
-        // Requires intentional downward movement so climbing UP from ground isn't cancelled
+        // ── GROUND DISMOUNT: exit climb near the bottom of the wall ──
+        // Two triggers:
+        //   A) Intentional: moving downward (inputDir has negative Y component)
+        //   B) Automatic: body is close to the ground regardless of input
         const onVerticalWall = Math.abs(this._climbNormal.y) < 0.3;
-        const movingDown = this.inputDir.y < -0.1;
-        if (onVerticalWall && movingDown && this._climbTime > 0.3) {
+        if (onVerticalWall && this._climbTime > 0.3) {
           _rayOrigin.copy(bodyPos);
-          const groundBelow = castSurface(_rayOrigin, _tmpV.set(0, -1, 0), this._groundMeshes, this.skeleton.spineHeight + 1.0);
+          const groundBelow = castSurface(_rayOrigin, _tmpV.set(0, -1, 0), this._groundMeshes, this.skeleton.spineHeight + 1.5);
           if (groundBelow && groundBelow.normal.y > 0.7) {
             const distToGround = bodyPos.y - groundBelow.point.y;
-            if (distToGround > 0 && distToGround < this.skeleton.spineHeight + 0.8) {
-              this.climbing = false;
-              this._climbTime = 0;
-              bodyPos.y = groundBelow.point.y + this.skeleton.spineHeight;
+            // A) Intentional dismount: moving downward and close to ground
+            const movingDown = this.inputDir.y < -0.05 ||
+              (this.inputDir.lengthSq() > 0.001 && this.inputDir.dot(_tmpV.set(0, -1, 0)) > 0.02);
+            // B) Automatic: very close to ground (within half spineHeight)
+            const veryClose = distToGround > 0 && distToGround < this.skeleton.spineHeight * 0.6;
+            if (distToGround > 0 && distToGround < this.skeleton.spineHeight + 0.8 && (movingDown || veryClose)) {
+              this._transitionRequest = {
+                type: 'wall_to_ground',
+                point: groundBelow.point.clone(),
+                normal: groundBelow.normal.clone(),
+                climbNormal: this._climbNormal.clone(),
+              };
             }
           }
         }
@@ -393,10 +464,15 @@ export class ProceduralWalk {
           const maintain = castSurface(bodyPos, this._climbDir, this._groundMeshes, this.climbMaintainDist);
 
           if (maintain && maintain.object.userData.climbable) {
-            // Still on surface — smooth-adopt the hit's normal (EMA filter)
-            const normalAlpha = Math.min(1, 20 * dt);
-            this._climbNormal.lerp(maintain.normal, normalAlpha).normalize();
-            this._climbDir.copy(this._climbNormal).negate();
+            this._maintainMissCount = 0; // reset miss counter on hit
+            // Smooth-adopt the hit's normal with angular gating.
+            // Ignore tiny jitter from mesh tessellation (< ~5.7° difference).
+            const normalDot = maintain.normal.dot(this._climbNormal);
+            if (normalDot < 0.995) {
+              const normalAlpha = Math.min(1, 10 * dt);
+              this._climbNormal.lerp(maintain.normal, normalAlpha).normalize();
+              this._climbDir.copy(this._climbNormal).negate();
+            }
 
             // ── LOOK-AHEAD: will we lose the surface next stride? ──
             // Cast from a point one stride ahead, along _climbDir
@@ -416,13 +492,22 @@ export class ProceduralWalk {
                 len: this.strideLength + 1,
               };
               const adj = castSurface(_rayOrigin, _tmpV2, this._groundMeshes, this.strideLength + 1);
-              if (adj && adj.normal.dot(this._climbNormal) < 0.9) {
+              if (adj && adj.normal.dot(this._climbNormal) < 0.85) {
                 const isFloor = adj.normal.y > 0.7;
                 if (adj.object.userData.climbable || isFloor) {
-                  // Fast blend toward adjacent face (floor or wall)
-                  this._climbNormal.lerp(adj.normal, Math.min(1, 20 * dt)).normalize();
-                  this._climbDir.copy(this._climbNormal).negate();
-                  if (isFloor) this.climbing = false;
+                  if (isFloor) {
+                    // Request orchestrated wall→top transition
+                    this._transitionRequest = {
+                      type: 'wall_to_top',
+                      point: adj.point.clone(),
+                      normal: adj.normal.clone(),
+                      climbNormal: this._climbNormal.clone(),
+                    };
+                  } else {
+                    // Wall-to-wall: smooth blend (no FSM needed)
+                    this._climbNormal.lerp(adj.normal, Math.min(1, 10 * dt)).normalize();
+                    this._climbDir.copy(this._climbNormal).negate();
+                  }
                 }
               }
             }
@@ -436,18 +521,31 @@ export class ProceduralWalk {
             const ahead = castSurface(bodyPos, this.inputDir, this._groundMeshes, this.climbDetectDist);
             if (ahead && (ahead.object.userData.climbable || ahead.normal.y > 0.7)) {
               const dot = ahead.normal.dot(this._climbNormal);
-              if (dot < 0.95) {
-                // Fast blend toward adjacent surface (faster for floor transitions)
-                const blendRate = ahead.normal.y > 0.7 ? 20 : 15;
-                this._climbNormal.lerp(ahead.normal, Math.min(1, blendRate * dt)).normalize();
-                this._climbDir.copy(this._climbNormal).negate();
-                if (ahead.normal.y > 0.7) this.climbing = false;
+              if (dot < 0.85) { // require significant angle (>~32°) to avoid tessellation jitter
+                if (ahead.normal.y > 0.7) {
+                  // Request orchestrated wall→top transition
+                  this._transitionRequest = {
+                    type: 'wall_to_top',
+                    point: ahead.point.clone(),
+                    normal: ahead.normal.clone(),
+                    climbNormal: this._climbNormal.clone(),
+                  };
+                } else {
+                  // Wall-to-wall corner: smooth blend (no FSM needed)
+                  this._climbNormal.lerp(ahead.normal, Math.min(1, 10 * dt)).normalize();
+                  this._climbDir.copy(this._climbNormal).negate();
+                }
               }
             }
 
           } else {
-            // ── EDGE WRAP: maintain missed — we're past the edge ──
+            // ── EDGE WRAP: maintain missed — require sustained miss before acting ──
+            this._maintainMissCount++;
             let wrapped = false;
+
+            // Require consecutive misses before triggering edge wrap probes.
+            // Single-frame misses are common on complex meshes (ray/tri precision).
+            if (this._maintainMissCount < 2) wrapped = true; // hold state, skip probes
 
             // Probe A — Adjacent face: start from the wall surface (not from body),
             // go INTO the wall, past the edge, and cast back.
@@ -466,13 +564,25 @@ export class ProceduralWalk {
             if (edgeHit && edgeHit.normal.dot(this._climbNormal) < 0.9) {
               const isFloor = edgeHit.normal.y > 0.7;
               if (edgeHit.object.userData.climbable || isFloor) {
-                this._climbNormal.copy(edgeHit.normal);
-                this._climbDir.copy(edgeHit.normal).negate();
-                bodyPos.copy(edgeHit.point).addScaledVector(edgeHit.normal, 0.15);
-                this._wrappedEdge = true;
-                this._movedDelta.set(0, 0, 0);
-                wrapped = true;
-                if (isFloor) this.climbing = false;
+                if (isFloor) {
+                  // Request orchestrated wall→top transition
+                  this._transitionRequest = {
+                    type: 'wall_to_top',
+                    point: edgeHit.point.clone(),
+                    normal: edgeHit.normal.clone(),
+                    climbNormal: this._climbNormal.clone(),
+                  };
+                  this._movedDelta.set(0, 0, 0);
+                  wrapped = true;
+                } else {
+                  // Wall-to-wall edge wrap
+                  this._climbNormal.copy(edgeHit.normal);
+                  this._climbDir.copy(edgeHit.normal).negate();
+                  bodyPos.copy(edgeHit.point).addScaledVector(edgeHit.normal, 0.15);
+                  this._wrappedEdge = true;
+                  this._movedDelta.set(0, 0, 0);
+                  wrapped = true;
+                }
               }
             }
 
@@ -489,13 +599,42 @@ export class ProceduralWalk {
               const backHit = castSurface(_rayOrigin, this._climbNormal, this._groundMeshes, 6);
               if (backHit && (backHit.object.userData.climbable || backHit.normal.y > 0.7)) {
                 const isFloor = backHit.normal.y > 0.7;
-                this._climbNormal.copy(backHit.normal);
-                this._climbDir.copy(backHit.normal).negate();
-                bodyPos.copy(backHit.point).addScaledVector(backHit.normal, 0.15);
-                this._wrappedEdge = true;
+                if (isFloor) {
+                  // Request orchestrated wall→top transition
+                  this._transitionRequest = {
+                    type: 'wall_to_top',
+                    point: backHit.point.clone(),
+                    normal: backHit.normal.clone(),
+                    climbNormal: this._climbNormal.clone(),
+                  };
+                  this._movedDelta.set(0, 0, 0);
+                  wrapped = true;
+                } else {
+                  // Wall-to-wall back-face wrap
+                  this._climbNormal.copy(backHit.normal);
+                  this._climbDir.copy(backHit.normal).negate();
+                  bodyPos.copy(backHit.point).addScaledVector(backHit.normal, 0.15);
+                  this._wrappedEdge = true;
+                  this._movedDelta.set(0, 0, 0);
+                  wrapped = true;
+                }
+              }
+            }
+
+            // Probe C — Ground below: last resort before detaching.
+            // If we lost the wall, check if there's ground to land on.
+            if (!wrapped) {
+              _rayOrigin.copy(bodyPos);
+              const gBelow = castSurface(_rayOrigin, _tmpV.set(0, -1, 0), this._groundMeshes, this.skeleton.spineHeight + 3);
+              if (gBelow && gBelow.normal.y > 0.7) {
+                this._transitionRequest = {
+                  type: 'wall_to_ground',
+                  point: gBelow.point.clone(),
+                  normal: gBelow.normal.clone(),
+                  climbNormal: this._climbNormal.clone(),
+                };
                 this._movedDelta.set(0, 0, 0);
                 wrapped = true;
-                if (isFloor) this.climbing = false;
               }
             }
 
@@ -545,10 +684,13 @@ export class ProceduralWalk {
 
         if (t >= 1) {
           limb.current.copy(ls.targetPos);
-          // Re-snap to surface at landing — body may have moved since step start
+          // Re-snap to surface at landing — body may have moved since step start.
+          // During transitions, _climbDir/_climbNormal are pre-set even if climbing
+          // flag hasn't flipped yet, so use _inTransition to force climb-mode casting.
           const bp = bodyGroup.position;
+          const useClimb = this.climbing || this._inTransition;
           const landNorm = placeOnSurface(limb.current, this._groundMeshes,
-            this._climbDir, this.climbing, bp.y, bp);
+            this._climbDir, useClimb, bp.y, bp);
           limb.surfaceNormal.copy(landNorm);
           limb.grounded = true;
           ls.done = true;
@@ -571,7 +713,7 @@ export class ProceduralWalk {
     // Tick cooldown
     if (this._stepCooldown > 0) this._stepCooldown -= dt;
 
-    if (!this.stepping && moving) {
+    if (!this.stepping && moving && !this._inTransition) {
       const bodyPos = bodyGroup.position;
 
       if (this._stepCooldown <= 0 && this._checkNeedStep(bodyPos, yaw)) {
@@ -582,7 +724,8 @@ export class ProceduralWalk {
     }
 
     // ── Idle behaviour: correction + fidget (shuffle / tap) ──
-    if (!this.stepping && !moving) {
+    // Skip entirely during controller-driven transitions — forced steps handle feet.
+    if (!this.stepping && !moving && !this._inTransition) {
       const bodyPos = bodyGroup.position;
 
       // Keep surface-width probe up to date while idle so hip scale adapts
@@ -696,7 +839,7 @@ export class ProceduralWalk {
             const gy = getGroundY(
               bodyPos.x + axis.x * d * sign,
               bodyPos.z + axis.z * d * sign,
-              this._groundMeshes, NaN
+              this._groundMeshes, NaN, bodyPos.y
             );
             if (!isNaN(gy) && Math.abs(gy - bodyPos.y) < 2.0) {
               edgeDist = d;
@@ -873,7 +1016,7 @@ export class ProceduralWalk {
       // Tap: slow rise (65 % of time), fast drop (35 %)
       const upPhase = 0.65;
       const h = this._idleTapHeight;
-      const groundY = getGroundY(limb.current.x, limb.current.z, this._groundMeshes, 0);
+      const groundY = getGroundY(limb.current.x, limb.current.z, this._groundMeshes, 0, limb.current.y);
       if (t < upPhase) {
         const u = t / upPhase;
         limb.current.y = groundY + h * u * u * (3 - 2 * u); // smoothstep rise
@@ -884,7 +1027,7 @@ export class ProceduralWalk {
     }
 
     if (t >= 1) {
-      limb.current.y = getGroundY(limb.current.x, limb.current.z, this._groundMeshes, 0);
+      limb.current.y = getGroundY(limb.current.x, limb.current.z, this._groundMeshes, 0, limb.current.y);
       limb.grounded  = true;
       this._idleAnimating = false;
     }
@@ -892,7 +1035,7 @@ export class ProceduralWalk {
 
   _cancelIdleAnimation() {
     const limb = this.limbs[this._idleLegIdx];
-    limb.current.y = getGroundY(limb.current.x, limb.current.z, this._groundMeshes, 0);
+    limb.current.y = getGroundY(limb.current.x, limb.current.z, this._groundMeshes, 0, limb.current.y);
     limb.grounded  = true;
     this._idleAnimating = false;
     this._idleTimer     = 0;

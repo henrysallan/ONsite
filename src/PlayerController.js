@@ -54,6 +54,28 @@ const _wallTarget  = new THREE.Vector3(); // target body pos on wall
 const _transStart  = new THREE.Vector3(); // body pos at transition start
 const _legTargets  = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
 const _edgeWallNrm = new THREE.Vector3(); // wall normal during transition
+const _bzA = new THREE.Vector3();
+const _bzB = new THREE.Vector3();
+const _bzC = new THREE.Vector3();
+
+/**
+ * Evaluate a cubic Bezier curve at parameter t ∈ [0,1].
+ * B(t) = (1-t)³·P0 + 3(1-t)²t·P1 + 3(1-t)t²·P2 + t³·P3
+ * Result is written to `out`.
+ */
+function evalBezier(out, p0, p1, p2, p3, t) {
+  const u = 1 - t;
+  const uu = u * u;
+  const uuu = uu * u;
+  const tt = t * t;
+  const ttt = tt * t;
+  out.set(
+    uuu * p0.x + 3 * uu * t * p1.x + 3 * u * tt * p2.x + ttt * p3.x,
+    uuu * p0.y + 3 * uu * t * p1.y + 3 * u * tt * p2.y + ttt * p3.y,
+    uuu * p0.z + 3 * uu * t * p1.z + 3 * u * tt * p2.z + ttt * p3.z,
+  );
+  return out;
+}
 
 /**
  * FPS-style player controller.
@@ -85,16 +107,25 @@ export class PlayerController {
     this._edgePushTime = 0;           // seconds spent pushing into an edge
     this._edgeCommitThreshold = 0.03; // seconds of sustained push before allowing wall transition
 
-    // ── Edge transition: two-phase step-down animation ──
-    this._edgeTransition = null;       // null | 'reach' | 'follow'
-    this._edgeTransTimer = 0;          // time into current phase
-    this._edgeTransDuration = 0.15;    // seconds per phase
-    this._edgeTransStartPos = new THREE.Vector3();
-    this._edgeTransMidPos   = new THREE.Vector3(); // edge position (phase 1 target)
-    this._edgeTransEndPos   = new THREE.Vector3(); // wall position (phase 2 target)
-    this._edgeTransWallNrm  = new THREE.Vector3();
-    this._edgeTransStartUp  = new THREE.Vector3();
-    this._edgeTransEndUp    = new THREE.Vector3();
+    // ── Transition cooldown: prevents rapid state oscillation near complex geometry ──
+    this._transitionCooldown = 0;
+    this._transitionCooldownDuration = 0.05;
+
+    // ── Unified surface transition FSM ──
+    // 3-phase (scout → bridge → complete) with cubic Bezier body path.
+    // Handles wall→ground, wall→top, and ledge→wall transitions.
+    this._transition = null;           // null | { type, phase }
+    this._transPhaseDuration = 0.02;   // seconds per phase
+    this._transTimer = 0;
+    // Bezier control points: P0 = start, P1 = lift-off handle, P2 = approach handle, P3 = end
+    this._transP0 = new THREE.Vector3();
+    this._transP1 = new THREE.Vector3();
+    this._transP2 = new THREE.Vector3();
+    this._transP3 = new THREE.Vector3();
+    this._transStartUp   = new THREE.Vector3();
+    this._transEndUp     = new THREE.Vector3();
+    this._transSrcNormal = new THREE.Vector3(); // source surface normal
+    this._transDstNormal = new THREE.Vector3(); // destination surface normal
 
     // ── Body orientation (quaternion-based for wall climbing) ──
     this._bodyUp = new THREE.Vector3(0, 1, 0);        // current smooth body "up"
@@ -202,8 +233,8 @@ export class PlayerController {
     }
 
     // Drive the walk system (pass yaw explicitly so walk doesn't depend on Euler decomposition)
-    // During edge transition, suppress normal input — forced steps handle feet
-    if (this._edgeTransition) {
+    // During transition, suppress normal input — forced steps handle feet
+    if (this._transition) {
       this.walk.setInput(_tmpV3.set(0, 0, 0));
       this.walk.setSmoothedInput(_tmpV3);
     } else {
@@ -221,8 +252,25 @@ export class PlayerController {
     this.walk.setBodyQuaternion(this.walk.climbing ? this._targetQuat : this.mesh.quaternion);
     const { movedDelta } = this.walk.update(dt, this.mesh, this.groundMeshes, this.yaw);
 
-    // ── Edge transition: if active, it drives body pos/orient and skips normal logic ──
-    if (this._updateEdgeTransition(dt)) {
+    // Tick transition cooldown
+    if (this._transitionCooldown > 0) this._transitionCooldown -= dt;
+
+    // ── Consume transition requests from ProceduralWalk ──
+    if (!this._transition && this._transitionCooldown <= 0 && this.walk._transitionRequest) {
+      const req = this.walk._transitionRequest;
+      // Gate: require minimum time on surface before allowing wall_to_top
+      // Prevents rapid oscillation near complex geometry corners
+      if (req.type === 'wall_to_top' && this.walk._climbTime < 0.15) {
+        this.walk.clearTransitionRequest(); // discard premature request
+      } else {
+        this._startTransition(req);
+        this.walk.clearTransitionRequest();
+        this.walk._inTransition = true;
+      }
+    }
+
+    // ── Unified transition FSM: if active, it drives body pos/orient and skips normal logic ──
+    if (this._updateTransition(dt)) {
       // Transition is driving everything — skip to IK update at the end
       this._noiseElapsed += dt;
       // Still update skeleton IK
@@ -250,19 +298,28 @@ export class PlayerController {
         this.mesh.position.copy(_candidatePos);
       } else {
         // Cast a ray from candidate position along -bodyUp to find the surface
-        // Filter to floor-like hits (normal.y > 0.5) to avoid wall side-faces
+        // Filter to floor-like hits (normal.y > 0.5) and prefer the hit closest
+        // to current body Y to avoid snapping onto overhangs above.
         _raycaster.set(
-          _tmpV3.copy(_candidatePos).addScaledVector(up, 2),
+          _tmpV3.copy(_candidatePos).addScaledVector(up, 5),
           _tmpV3b.copy(up).negate()
         );
-        _raycaster.far = 10;
+        _raycaster.far = 15;
         _pcHitsArray.length = 0;
         _raycaster.intersectObjects(this.groundMeshes, false, _pcHitsArray);
         let floorHit = null;
+        let bestFloorDist = Infinity;
+        const currentY = this.mesh.position.y;
         for (let i = 0; i < _pcHitsArray.length; i++) {
           const h = _pcHitsArray[i];
           _tmpV3.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
-          if (_tmpV3.y > 0.5) { floorHit = h; break; }
+          if (_tmpV3.y > 0.5) {
+            const dy = Math.abs(h.point.y - currentY);
+            if (dy < bestFloorDist) {
+              bestFloorDist = dy;
+              floorHit = h;
+            }
+          }
         }
         if (floorHit) {
           const surfaceY = floorHit.point.y;
@@ -301,6 +358,23 @@ export class PlayerController {
           }
         }
       }
+    }
+
+    // ── Transition just started by _enterClimbFromEdge? Skip to IK. ──
+    // Without this, orientation / height-smoothing / joint-collision would run
+    // with climb-mode flags but ground-positioned feet, corrupting body state.
+    if (this._transition) {
+      this._noiseElapsed += dt;
+      const skelGroup = this.skeleton.group;
+      skelGroup.updateMatrixWorld(true);
+      _invSkelLocal.copy(skelGroup.matrix).invert();
+      this.walk.cacheBodyInverse(this.mesh);
+      for (let i = 0; i < 6; i++) {
+        const footLocal = this.walk.getFootLocal(i);
+        _footTmp.copy(footLocal).applyMatrix4(_invSkelLocal);
+        this.skeleton.updateLimb(i, _footTmp);
+      }
+      return;
     }
 
     // ── Body orientation from foot plane / wall normal ──
@@ -515,6 +589,7 @@ export class PlayerController {
    */
   _tryEdgeClimb(candidatePos, inputDir) {
     if (inputDir.lengthSq() < 0.001) return false;
+    if (this._transitionCooldown > 0) return false;
 
     // Probe from below the current wall top so the ray hits the side face
     const probeY = this.mesh.position.y - this.skeleton.spineHeight - 0.5;
@@ -553,48 +628,55 @@ export class PlayerController {
   }
 
   /**
-   * Start a two-phase step-down transition from a wall top to the wall face.
-   * Phase 'reach': Body slides to edge, leading legs reach down onto wall.
-   * Phase 'follow': Body moves to wall, trailing legs follow.
+   * Start a three-phase transition from a wall top down to the wall face.
+   * Uses a cubic Bezier curve that arcs outward around the edge.
    */
   _enterClimbFromEdge(hit, wn) {
-    // Compute key positions
     const bodyPos = this.mesh.position;
     const spineH = this.skeleton.spineHeight;
 
-    // Edge position: top of the wall face, at the player's current height
+    // The edge point: where the wall top meets the side face
     _edgePos.set(
       hit.point.x + wn.x * 0.05,
       bodyPos.y,
       hit.point.z + wn.z * 0.05
     );
 
-    // Wall target: on the wall face, one spineHeight below the edge
+    // Final destination: on the wall face, offset outward by spineHeight
     _wallTarget.set(
       hit.point.x + wn.x * (spineH + 0.15),
-      bodyPos.y - spineH * 1.2,
+      bodyPos.y - spineH * 1.5,
       hit.point.z + wn.z * (spineH + 0.15)
     );
 
-    // Store transition state
-    this._edgeTransition = 'reach';
-    this._edgeTransTimer = 0;
-    this._edgeTransStartPos.copy(bodyPos);
-    this._edgeTransMidPos.copy(_edgePos);
-    this._edgeTransEndPos.copy(_wallTarget);
-    this._edgeTransWallNrm.copy(wn);
-    this._edgeTransStartUp.copy(this._bodyUp);
-    this._edgeTransEndUp.copy(wn);
-
-    // Pre-set climb state so foot placement uses wall-mode casting
-    this.walk.climbing = true;
+    // Don't flip walk.climbing yet — store pending climb state on the transition.
+    // Foot landing snaps need climbDir/climbNormal, but the walk system's orientation
+    // and home-position math should stay in ground mode until finalization.
     this.walk._climbTime = 0;
     this.walk._climbNormal.copy(wn);
     this.walk._climbDir.copy(wn).negate();
 
-    // Compute wall-face foot targets for leading group (A)
+    // ── Bezier control points ──
+    // P0: current position (on top of wall)
+    // P1: at the edge, lifted along current up — peels body off the top surface
+    // P2: outward from the wall near the end position — guides body along wall normal
+    // P3: final position on wall face
+    this._transP0.copy(bodyPos);
+    this._transP1.copy(_edgePos).addScaledVector(this._bodyUp, spineH * 0.3);
+    this._transP2.copy(_wallTarget).addScaledVector(wn, spineH * 0.6);
+    this._transP3.copy(_wallTarget);
+
+    this._transition = { type: 'ledge_to_wall', phase: 'scout', pendingClimb: true };
+    this._transTimer = 0;
+    this._transStartUp.copy(this._bodyUp);
+    this._transEndUp.copy(wn);
+    this._transSrcNormal.set(0, 1, 0);
+    this._transDstNormal.copy(wn);
+
+    // Scout: leading legs reach down onto wall
     this._computeWallFootTargets('A', _wallTarget, wn);
-    this.walk.forceStepGroup('A', _legTargets, 0.15);
+    this.walk.forceStepGroup('A', _legTargets, 0.06);
+    this.walk._inTransition = true;
 
     return true;
   }
@@ -635,54 +717,164 @@ export class PlayerController {
     }
   }
 
-  /** Advance the two-phase edge transition. Returns true while active. */
-  _updateEdgeTransition(dt) {
-    if (!this._edgeTransition) return false;
+  /**
+   * Start the unified transition FSM from a ProceduralWalk transition request.
+   * Computes cubic Bezier control points that arc the body safely around edges.
+   */
+  _startTransition(req) {
+    const bodyPos = this.mesh.position;
+    const spineH = this.skeleton.spineHeight;
 
-    this._edgeTransTimer += dt;
-    const t = Math.min(this._edgeTransTimer / this._edgeTransDuration, 1);
-    // Smooth ease-in-out
+    if (req.type === 'wall_to_ground') {
+      // Body arcs DOWN from wall face, outward, then settles on ground.
+      const groundY = req.point.y;
+      // Final position: standing on ground, offset away from wall
+      _wallTarget.set(
+        bodyPos.x + req.climbNormal.x * (spineH * 0.8),
+        groundY + spineH,
+        bodyPos.z + req.climbNormal.z * (spineH * 0.8)
+      );
+
+      // P0: current wall position
+      // P1: push outward from wall (along wall normal) — lifts body off surface
+      // P2: above final ground position — guides arc downward
+      // P3: standing on ground
+      this._transP0.copy(bodyPos);
+      this._transP1.copy(bodyPos).addScaledVector(req.climbNormal, spineH * 0.8);
+      this._transP2.copy(_wallTarget).addScaledVector(req.normal, spineH * 0.5);
+      this._transP3.copy(_wallTarget);
+
+      this._transition = { type: 'wall_to_ground', phase: 'scout' };
+      this._transTimer = 0;
+      this._transStartUp.copy(this._bodyUp);
+      this._transEndUp.copy(req.normal);
+      this._transSrcNormal.copy(req.climbNormal);
+      this._transDstNormal.copy(req.normal);
+
+      // Scout: leading legs reach down to ground
+      this._computeGroundFootTargets('A', _wallTarget, req.normal);
+      this.walk.forceStepGroup('A', _legTargets, 0.05);
+
+    } else if (req.type === 'wall_to_top') {
+      // Body arcs UP from wall face, over the edge, onto the top surface.
+      const topY = req.point.y;
+      // Final position: standing on top, inward from edge
+      _wallTarget.copy(req.point);
+      _wallTarget.y = topY + spineH;
+      // Push inward (OPPOSITE to climbNormal since climbNormal points away from wall)
+      // On a wall, climbNormal points outward. The top surface is "behind" the normal.
+      // So to go inward we move along -climbNormal projected onto the floor plane.
+      const inwardX = -req.climbNormal.x;
+      const inwardZ = -req.climbNormal.z;
+      const inLen = Math.sqrt(inwardX * inwardX + inwardZ * inwardZ);
+      if (inLen > 0.01) {
+        _wallTarget.x += (inwardX / inLen) * spineH * 0.5;
+        _wallTarget.z += (inwardZ / inLen) * spineH * 0.5;
+      }
+
+      // P0: current wall position
+      // P1: push outward + up from wall — lifts body off and above edge
+      // P2: above final position on top — guides body onto surface
+      // P3: standing on top
+      this._transP0.copy(bodyPos);
+      this._transP1.copy(bodyPos)
+        .addScaledVector(req.climbNormal, spineH * 0.6)
+        .addScaledVector(req.normal, spineH * 0.8);
+      this._transP2.copy(_wallTarget).addScaledVector(req.normal, spineH * 0.4);
+      this._transP3.copy(_wallTarget);
+
+      this._transition = { type: 'wall_to_top', phase: 'scout' };
+      this._transTimer = 0;
+      this._transStartUp.copy(this._bodyUp);
+      this._transEndUp.copy(req.normal);
+      this._transSrcNormal.copy(req.climbNormal);
+      this._transDstNormal.copy(req.normal);
+
+      // Scout: leading legs reach up onto the top surface
+      this._computeGroundFootTargets('A', _wallTarget, req.normal);
+      this.walk.forceStepGroup('A', _legTargets, 0.06);
+    }
+
+    // Suppress walk input during transition
+    this.walk.setInput(_tmpV3.set(0, 0, 0));
+    this.walk.setSmoothedInput(_tmpV3);
+  }
+
+  /**
+   * Advance the unified 3-phase transition FSM.
+   * Body follows a cubic Bezier curve; orientation slerps smoothly across the full duration.
+   * Returns true while a transition is active (caller should skip normal update logic).
+   */
+  _updateTransition(dt) {
+    if (!this._transition) return false;
+
+    this._transTimer += dt;
+    const t = Math.min(this._transTimer / this._transPhaseDuration, 1);
+    // Smooth ease-in-out per phase
     const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
 
-    const wn = this._edgeTransWallNrm;
+    const phase = this._transition.phase;
+    const type  = this._transition.type;
 
-    if (this._edgeTransition === 'reach') {
-      // Phase 1: Body slides from start to edge, leading legs stepping to wall
-      this.mesh.position.lerpVectors(this._edgeTransStartPos, this._edgeTransMidPos, ease);
+    // ── Overall progress across all 3 phases (0..1) ──
+    const phaseIdx = phase === 'scout' ? 0 : phase === 'bridge' ? 1 : 2;
+    const overallT = (phaseIdx + ease) / 3;
 
-      // Smoothly rotate body up from ground-up toward wall normal
-      this._bodyUp.lerpVectors(this._edgeTransStartUp, this._edgeTransEndUp, ease * 0.3).normalize();
+    // ── Body position: evaluate Bezier at overall progress ──
+    evalBezier(this.mesh.position, this._transP0, this._transP1, this._transP2, this._transP3, overallT);
 
-      if (t >= 1) {
-        // Phase 1 complete — start phase 2
-        this._edgeTransition = 'follow';
-        this._edgeTransTimer = 0;
-        this._edgeTransStartPos.copy(this.mesh.position);
+    // ── Orientation blend: type-dependent curve ──
+    // ledge_to_wall: body stays upright during scout phase, rotates during bridge+complete.
+    //   This prevents a jarring 90° snap while the creature is still on the ledge.
+    // wall_to_ground/wall_to_top: commit orientation earlier so body looks attached to
+    //   the destination surface before the animation ends.
+    let orientT;
+    if (type === 'ledge_to_wall' || type === 'wall_to_ground') {
+      // Delay: no rotation until bridge phase (overallT > 0.33)
+      // For ledge_to_wall: body stays upright while scouts reach the wall
+      // For wall_to_ground: body stays wall-attached while scouts reach the ground
+      orientT = Math.min(1, Math.max(0, (overallT - 0.33) / 0.67));
+    } else {
+      // wall_to_top: commit earlier so body looks attached before animation ends
+      orientT = Math.min(1, overallT * 1.4);
+    }
+    const smoothOrient = orientT * orientT * (3 - 2 * orientT);
+    this._bodyUp.lerpVectors(this._transStartUp, this._transEndUp, smoothOrient).normalize();
 
-        // Step trailing group (B) to wall targets
-        this._computeWallFootTargets('B', this._edgeTransEndPos, wn);
-        this.walk.forceStepGroup('B', _legTargets, 0.15);
-      }
-    } else if (this._edgeTransition === 'follow') {
-      // Phase 2: Body moves from edge to wall position, trailing legs following
-      this.mesh.position.lerpVectors(this._edgeTransStartPos, this._edgeTransEndPos, ease);
-
-      // Continue rotating body up toward wall normal
-      const upBlend = 0.3 + 0.7 * ease;
-      this._bodyUp.lerpVectors(this._edgeTransStartUp, this._edgeTransEndUp, upBlend).normalize();
-
-      if (t >= 1) {
-        // Transition complete — finalize climb state
-        this._edgeTransition = null;
-        this.mesh.position.copy(this._edgeTransEndPos);
-        this._bodyUp.copy(wn).normalize();
-        this._targetUp.copy(wn);
-        this.walk._climbTime = 0;
-        this._edgePushTime = 0;
+    // ── Phase advancement ──
+    if (t >= 1) {
+      if (phase === 'scout') {
+        // Scout complete → Bridge: step the trailing group
+        this._transition.phase = 'bridge';
+        this._transTimer = 0;
+        if (type === 'wall_to_ground') {
+          this._computeGroundFootTargets('B', this._transP3, this._transDstNormal);
+          this.walk.forceStepGroup('B', _legTargets, 0.05);
+        } else if (type === 'wall_to_top') {
+          this._computeGroundFootTargets('B', this._transP3, this._transDstNormal);
+          this.walk.forceStepGroup('B', _legTargets, 0.06);
+        } else if (type === 'ledge_to_wall') {
+          this._computeWallFootTargets('B', this._transP3, this._transDstNormal);
+          this.walk.forceStepGroup('B', _legTargets, 0.06);
+        }
+      } else if (phase === 'bridge') {
+        // Bridge complete → Complete: final settling, re-step leading group to home
+        this._transition.phase = 'complete';
+        this._transTimer = 0;
+        if (type === 'wall_to_ground' || type === 'wall_to_top') {
+          this._computeGroundFootTargets('A', this._transP3, this._transDstNormal);
+          this.walk.forceStepGroup('A', _legTargets, 0.04);
+        } else if (type === 'ledge_to_wall') {
+          this._computeWallFootTargets('A', this._transP3, this._transDstNormal);
+          this.walk.forceStepGroup('A', _legTargets, 0.04);
+        }
+      } else if (phase === 'complete') {
+        // ── Transition finished — finalize state ──
+        this._finalizeTransition();
       }
     }
 
-    // Update body orientation during transition
+    // ── Update body orientation during transition ──
     _bodyForward.set(0, 0, 1).applyAxisAngle(_yAxis, this.yaw);
     _bodyForward.sub(_tmpV3.copy(this._bodyUp).multiplyScalar(_bodyForward.dot(this._bodyUp)));
     if (_bodyForward.lengthSq() < 0.001) {
@@ -696,6 +888,83 @@ export class PlayerController {
     this.mesh.quaternion.setFromRotationMatrix(_rotMat);
 
     return true;
+  }
+
+  /** Finalize the transition: commit climbing state, reset FSM. */
+  _finalizeTransition() {
+    const type = this._transition.type;
+
+    // Snap body to the exact end position
+    this.mesh.position.copy(this._transP3);
+    this._bodyUp.copy(this._transEndUp).normalize();
+    this._targetUp.copy(this._transEndUp);
+
+    if (type === 'wall_to_ground' || type === 'wall_to_top') {
+      // Now on the ground/top surface
+      this.walk.climbing = false;
+      this.walk._climbTime = 0;
+    } else if (type === 'ledge_to_wall') {
+      // Now on the wall — commit the deferred climb state
+      this.walk.climbing = true;
+      this.walk._climbTime = 0;
+    }
+
+    this._transition = null;
+    this._edgePushTime = 0;
+    // Clear any stale transition request to prevent immediate re-triggering
+    this.walk.clearTransitionRequest();
+    this.walk._inTransition = false;
+    this._transitionCooldown = this._transitionCooldownDuration;
+  }
+
+  /**
+   * Compute 3 foot target positions on a ground/floor surface for a given leg group.
+   * Positions are arranged around targetPos on the horizontal plane.
+   */
+  _computeGroundFootTargets(groupName, targetPos, surfNormal) {
+    const group = groupName === 'A' ? this.walk.groupA : this.walk.groupB;
+    // Use yaw-based axes for ground placement
+    _bodyForward.set(0, 0, 1).applyAxisAngle(_yAxis, this.yaw);
+    _bodyForward.sub(_tmpV3.copy(surfNormal).multiplyScalar(_bodyForward.dot(surfNormal)));
+    if (_bodyForward.lengthSq() < 0.001) {
+      _bodyForward.set(1, 0, 0);
+      _bodyForward.sub(_tmpV3.copy(surfNormal).multiplyScalar(_bodyForward.dot(surfNormal)));
+    }
+    _bodyForward.normalize();
+    _bodyRight.crossVectors(surfNormal, _bodyForward).normalize();
+
+    for (let g = 0; g < 3; g++) {
+      const limb = this.walk.limbs[group[g]];
+      const hx = limb.home.x * this.walk._hipScale;
+      const hz = limb.home.z * this.walk._hipScale;
+      _legTargets[g].copy(targetPos)
+        .addScaledVector(_bodyRight, hx)
+        .addScaledVector(_bodyForward, hz);
+      // Snap to actual ground surface — prefer the hit closest to target Y
+      // to avoid snapping to overhangs above.
+      _rayOrigin.copy(_legTargets[g]);
+      _rayOrigin.y += 3;
+      _raycaster.set(_rayOrigin, _tmpV3.set(0, -1, 0));
+      _raycaster.far = 10;
+      _pcHitsArray.length = 0;
+      _raycaster.intersectObjects(this.groundMeshes, false, _pcHitsArray);
+      let bestHit = null;
+      let bestDist = Infinity;
+      for (let i = 0; i < _pcHitsArray.length; i++) {
+        const h = _pcHitsArray[i];
+        _tmpV3.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
+        if (_tmpV3.y > 0.5) {
+          const dy = Math.abs(h.point.y - targetPos.y);
+          if (dy < bestDist) {
+            bestDist = dy;
+            bestHit = h;
+          }
+        }
+      }
+      if (bestHit) {
+        _legTargets[g].copy(bestHit.point);
+      }
+    }
   }
 }
 
