@@ -37,7 +37,23 @@ const _bodyRight = new THREE.Vector3();
 const _rotMat = new THREE.Matrix4();
 const _invSkelLocal = new THREE.Matrix4();
 const _footTmp = new THREE.Vector3();
+const _nodeWorld = new THREE.Vector3();
+const _defaultWallFwd = new THREE.Vector3();
 const _pcHitsArray = [];  // reusable array for intersectObjects
+
+// ── Joint collision resolution helpers ──
+const _probeOrig = new THREE.Vector3();
+const _probeNeg  = new THREE.Vector3();
+const _jointW    = new THREE.Vector3();
+const JOINT_MIN_CLEARANCE = 0.12; // minimum distance spine nodes keep from wall surfaces
+const JOINT_PROBE_LEN     = 3.0;  // how far outside each joint to start the probe ray
+
+// ── Edge transition helpers ──
+const _edgePos     = new THREE.Vector3(); // edge point (top of wall face)
+const _wallTarget  = new THREE.Vector3(); // target body pos on wall
+const _transStart  = new THREE.Vector3(); // body pos at transition start
+const _legTargets  = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
+const _edgeWallNrm = new THREE.Vector3(); // wall normal during transition
 
 /**
  * FPS-style player controller.
@@ -65,6 +81,21 @@ export class PlayerController {
     this.groundMeshes = [];
     this.maxStepHeight = 1.2; // max height difference the body can climb onto
 
+    // ── Edge commitment: prevents accidental wall transitions ──
+    this._edgePushTime = 0;           // seconds spent pushing into an edge
+    this._edgeCommitThreshold = 0.03; // seconds of sustained push before allowing wall transition
+
+    // ── Edge transition: two-phase step-down animation ──
+    this._edgeTransition = null;       // null | 'reach' | 'follow'
+    this._edgeTransTimer = 0;          // time into current phase
+    this._edgeTransDuration = 0.15;    // seconds per phase
+    this._edgeTransStartPos = new THREE.Vector3();
+    this._edgeTransMidPos   = new THREE.Vector3(); // edge position (phase 1 target)
+    this._edgeTransEndPos   = new THREE.Vector3(); // wall position (phase 2 target)
+    this._edgeTransWallNrm  = new THREE.Vector3();
+    this._edgeTransStartUp  = new THREE.Vector3();
+    this._edgeTransEndUp    = new THREE.Vector3();
+
     // ── Body orientation (quaternion-based for wall climbing) ──
     this._bodyUp = new THREE.Vector3(0, 1, 0);        // current smooth body "up"
     this._targetUp = new THREE.Vector3(0, 1, 0);      // target up from foot plane
@@ -76,6 +107,13 @@ export class PlayerController {
     // ── Climb facing: spine follows movement direction on walls ──
     this._climbFacing = new THREE.Vector3(0, 1, 0);    // smoothed movement direction on wall
     this.climbFacingSmooth = 14;                         // how fast facing tracks movement dir
+
+    // ── Momentum-carry for wall transitions ──
+    this._climbWallFwd = new THREE.Vector3(0, 1, 0);   // current "forward" on the wall surface
+    this._wasClimbing = false;                           // track climb entry
+    this._climbIdleTime = 0;                             // seconds idle while climbing
+    this._climbResetTime = 0.4;                          // idle time before forward resets to default
+    this._prevInputDir = new THREE.Vector3();            // last frame's movement direction
 
     // ── Body noise parameters ──
     this.bodyNoise = {
@@ -114,7 +152,10 @@ export class PlayerController {
       if (document.pointerLockElement !== renderer_domElement) return;
       this.yaw -= e.movementX * this.mouseSensitivity;
       this.pitch -= e.movementY * this.mouseSensitivity;
-      this.pitch = Math.max(-Math.PI / 3, Math.min(Math.PI / 3, this.pitch));
+      // Expand pitch range on steep surfaces (walls) so camera can look further down
+      const steepness = 1 - Math.abs(this._bodyUp.y); // 0 on flat ground, ~1 on vertical wall
+      const maxPitch = Math.PI / 3 + steepness * Math.PI / 4; // 60° normally, up to 105° on walls
+      this.pitch = Math.max(-maxPitch, Math.min(maxPitch, this.pitch));
     };
     document.addEventListener('mousemove', this._onMouseMove);
   }
@@ -130,29 +171,17 @@ export class PlayerController {
     if (k['KeyA'] || k['ArrowLeft'])  right += 1;
     if (k['KeyD'] || k['ArrowRight']) right -= 1;
 
-    // Build input direction — different model for climbing vs ground
+    // Build input direction — camera-yaw based, projected onto current surface
     const up = this._bodyUp;
 
-    if (this.walk.climbing) {
-      // Wall-space 2D movement: W/S = up/down the wall, A/D = sideways on the wall.
-      // "Forward" on the wall = world-up projected onto the wall plane.
-      const wn = this.walk._climbNormal;
-      _forward.set(0, 1, 0).sub(_tmpV3.copy(wn).multiplyScalar(wn.y));
-      if (_forward.lengthSq() < 0.001) {
-        // Ceiling / floor edge-case: fall back to camera forward projected onto surface
-        _forward.set(0, 0, 1).applyAxisAngle(_yAxis, this.yaw);
-        _forward.sub(_tmpV3.copy(wn).multiplyScalar(_forward.dot(wn)));
-      }
-      _forward.normalize();
-
-      // "Right" = perpendicular to forward and normal, oriented to match camera's right
-      _rightDir.crossVectors(wn, _forward).normalize();
-      _tmpV3.set(1, 0, 0).applyAxisAngle(_yAxis, this.yaw); // camera right
-      if (_rightDir.dot(_tmpV3) < 0) _rightDir.negate();
-    } else {
-      // Ground: camera yaw drives direction
+    {
+      // Full camera direction (yaw + pitch) projected onto the body's surface plane.
+      // Pitch lets you aim up/down walls; on flat ground its effect is negligible.
       _forward.set(0, 0, 1).applyAxisAngle(_yAxis, this.yaw);
-      _rightDir.set(1, 0, 0).applyAxisAngle(_yAxis, this.yaw);
+      const cy = Math.cos(this.pitch), sy = Math.sin(this.pitch);
+      _forward.x *= cy; _forward.z *= cy; _forward.y = sy;
+
+      _rightDir.set(1, 0, 0).applyAxisAngle(_yAxis, this.yaw); // yaw-only for strafe
 
       _forward.sub(_tmpV3.copy(up).multiplyScalar(_forward.dot(up)));
       if (_forward.lengthSq() < 0.001) {
@@ -173,35 +202,55 @@ export class PlayerController {
     }
 
     // Drive the walk system (pass yaw explicitly so walk doesn't depend on Euler decomposition)
-    // When climbing, the walk system needs the body quaternion for home rotation
-    this.walk.setInput(_inputDir);
+    // During edge transition, suppress normal input — forced steps handle feet
+    if (this._edgeTransition) {
+      this.walk.setInput(_tmpV3.set(0, 0, 0));
+      this.walk.setSmoothedInput(_tmpV3);
+    } else {
+      this.walk.setInput(_inputDir);
+      // Smoothed input for stride lead (uses previous-frame smooth values — 1-frame lag is fine)
+      _tmpV3.set(0, 0, 0);
+      if (Math.abs(this._smoothFwd) > 0.01 || Math.abs(this._smoothRight) > 0.01) {
+        _tmpV3.addScaledVector(_forward, this._smoothFwd);
+        _tmpV3.addScaledVector(_rightDir, this._smoothRight);
+        if (_tmpV3.lengthSq() > 0.001) _tmpV3.normalize();
+      }
+      this.walk.setSmoothedInput(_tmpV3);
+    }
     this.walk.setBodyUp(this._bodyUp);
     this.walk.setBodyQuaternion(this.walk.climbing ? this._targetQuat : this.mesh.quaternion);
     const { movedDelta } = this.walk.update(dt, this.mesh, this.groundMeshes, this.yaw);
+
+    // ── Edge transition: if active, it drives body pos/orient and skips normal logic ──
+    if (this._updateEdgeTransition(dt)) {
+      // Transition is driving everything — skip to IK update at the end
+      this._noiseElapsed += dt;
+      // Still update skeleton IK
+      const skelGroup = this.skeleton.group;
+      skelGroup.updateMatrixWorld(true);
+      _invSkelLocal.copy(skelGroup.matrix).invert();
+      this.walk.cacheBodyInverse(this.mesh);
+      for (let i = 0; i < 6; i++) {
+        const footLocal = this.walk.getFootLocal(i);
+        _footTmp.copy(footLocal).applyMatrix4(_invSkelLocal);
+        this.skeleton.updateLimb(i, _footTmp);
+      }
+      return;
+    }
+
+    // Reset edge commitment when not actively pushing
+    if (_inputDir.lengthSq() < 0.001) this._edgePushTime = 0;
 
     // Apply body movement — check step height limit (skip when climbing)
     if (movedDelta.lengthSq() > 0.0001) {
       _candidatePos.copy(this.mesh.position).add(movedDelta);
 
       if (this.walk.climbing) {
-        // Move along wall, then constrain to prevent clipping
+        // Move along wall — anti-clip is handled below in the per-spine-node pass
         this.mesh.position.copy(_candidatePos);
-        // Anti-clip: push body back if it penetrates the surface
-        const wn = this.walk._climbNormal;
-        _tmpV3.copy(this.mesh.position).addScaledVector(wn, 2);
-        _raycaster.set(_tmpV3, _tmpV3b.copy(wn).negate());
-        _raycaster.far = 5;
-        _pcHitsArray.length = 0;
-        _raycaster.intersectObjects(this.groundMeshes, false, _pcHitsArray);
-        if (_pcHitsArray.length > 0 && _pcHitsArray[0].object.userData.climbable) {
-          _tmpV3.subVectors(this.mesh.position, _pcHitsArray[0].point);
-          const surfDist = _tmpV3.dot(wn);
-          if (surfDist < 0.05) {
-            this.mesh.position.addScaledVector(wn, 0.05 - surfDist);
-          }
-        }
       } else {
         // Cast a ray from candidate position along -bodyUp to find the surface
+        // Filter to floor-like hits (normal.y > 0.5) to avoid wall side-faces
         _raycaster.set(
           _tmpV3.copy(_candidatePos).addScaledVector(up, 2),
           _tmpV3b.copy(up).negate()
@@ -209,17 +258,47 @@ export class PlayerController {
         _raycaster.far = 10;
         _pcHitsArray.length = 0;
         _raycaster.intersectObjects(this.groundMeshes, false, _pcHitsArray);
-        if (_pcHitsArray.length > 0) {
-          const surfaceY = _pcHitsArray[0].point.y;
+        let floorHit = null;
+        for (let i = 0; i < _pcHitsArray.length; i++) {
+          const h = _pcHitsArray[i];
+          _tmpV3.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
+          if (_tmpV3.y > 0.5) { floorHit = h; break; }
+        }
+        if (floorHit) {
+          const surfaceY = floorHit.point.y;
           const currentSurfaceY = this.mesh.position.y;
           const heightDiff = surfaceY - currentSurfaceY;
           if (heightDiff > this.maxStepHeight) {
+            // Too high to step up — block
             movedDelta.set(0, 0, 0);
+          } else if (heightDiff < -this.maxStepHeight) {
+            // Edge detected — accumulate push time before allowing wall transition
+            this._edgePushTime += dt;
+            if (this._edgePushTime >= this._edgeCommitThreshold) {
+              if (!this._tryEdgeClimb(_candidatePos, _inputDir)) {
+                movedDelta.set(0, 0, 0); // no wall — block
+              } else {
+                this._edgePushTime = 0; // reset on successful transition
+              }
+            } else {
+              movedDelta.set(0, 0, 0); // not committed yet — block but keep accumulating
+            }
           } else {
+            this._edgePushTime = 0; // walking on solid ground — reset
             this.mesh.position.copy(_candidatePos);
           }
         } else {
-          this.mesh.position.copy(_candidatePos);
+          // No floor at candidate — accumulate push time
+          this._edgePushTime += dt;
+          if (this._edgePushTime >= this._edgeCommitThreshold) {
+            if (!this._tryEdgeClimb(_candidatePos, _inputDir)) {
+              movedDelta.set(0, 0, 0);
+            } else {
+              this._edgePushTime = 0;
+            }
+          } else {
+            movedDelta.set(0, 0, 0);
+          }
         }
       }
     }
@@ -235,8 +314,9 @@ export class PlayerController {
     }
 
     // Smoothly interpolate body up toward the target surface normal
-    // Use faster rate during edge-wrap transitions so orientation snaps quickly
-    const orientRate = this.walk._wrappedEdge ? 25 : this.bodyOrientSmooth;
+    // Use faster rate during edge-wrap or just-dismounted transitions
+    const justDismounted = !this.walk.climbing && this._bodyUp.dot(this._targetUp) < 0.85;
+    const orientRate = (this.walk._wrappedEdge || justDismounted) ? 25 : this.bodyOrientSmooth;
     const tiltAlpha = Math.min(1, orientRate * dt);
     this._bodyUp.lerp(this._targetUp, tiltAlpha).normalize();
 
@@ -245,23 +325,20 @@ export class PlayerController {
     // 2) Surface tilt is smoothed via _bodyUp lerp above
 
     if (this.walk.climbing) {
-      // On a wall: spine follows the movement direction, not the camera
-      // Update climb facing when there's input
-      if (_inputDir.lengthSq() > 0.001) {
-        // Project input onto wall plane (remove component along wall normal)
-        _tmpV3.copy(_inputDir);
-        _tmpV3.sub(_tmpV3b.copy(this._bodyUp).multiplyScalar(_tmpV3.dot(this._bodyUp)));
-        if (_tmpV3.lengthSq() > 0.001) {
-          _tmpV3.normalize();
-          const facingAlpha = Math.min(1, this.climbFacingSmooth * dt);
-          this._climbFacing.lerp(_tmpV3, facingAlpha).normalize();
-        }
-      }
-      _bodyForward.copy(this._climbFacing);
-      // Ensure it's orthogonal to bodyUp
+      // On a wall: spine follows full camera direction (yaw + pitch) projected onto wall plane.
+      // Pitch is critical — without it, looking straight at the wall causes a degenerate
+      // yaw-only projection that points 90° from the actual movement direction.
+      _bodyForward.set(0, 0, 1).applyAxisAngle(_yAxis, this.yaw);
+      const bcy = Math.cos(this.pitch), bsy = Math.sin(this.pitch);
+      _bodyForward.x *= bcy; _bodyForward.z *= bcy; _bodyForward.y = bsy;
       _bodyForward.sub(_tmpV3.copy(this._bodyUp).multiplyScalar(_bodyForward.dot(this._bodyUp)));
-      if (_bodyForward.lengthSq() < 0.001) _bodyForward.set(0, 1, 0); // default: up on wall
+      if (_bodyForward.lengthSq() < 0.001) {
+        _bodyForward.set(1, 0, 0).applyAxisAngle(_yAxis, this.yaw);
+        _bodyForward.x *= bcy; _bodyForward.z *= bcy; _bodyForward.y = bsy;
+        _bodyForward.sub(_tmpV3.copy(this._bodyUp).multiplyScalar(_bodyForward.dot(this._bodyUp)));
+      }
       _bodyForward.normalize();
+      this._climbFacing.copy(_bodyForward);
     } else {
       // On ground: spine follows camera yaw instantly
       _bodyForward.set(0, 0, 1).applyAxisAngle(_yAxis, this.yaw);
@@ -301,7 +378,68 @@ export class PlayerController {
     // Deadband: skip tiny adjustments to prevent correction-loop feedback on walls
     if (Math.abs(heightDiff) > 0.01) {
       const posAlpha = Math.min(1, this.bodyPosSmooth * dt);
-      this.mesh.position.addScaledVector(this._bodyUp, heightDiff * posAlpha);
+      // Drop-rate limiter: clamp downward movement to prevent plummeting through surfaces
+      const maxDrop = 2.0 * dt; // max 2 units/sec downward
+      const rawDelta = heightDiff * posAlpha;
+      const clampedDelta = rawDelta < -maxDrop ? -maxDrop : rawDelta;
+      this.mesh.position.addScaledVector(this._bodyUp, clampedDelta);
+    }
+
+    // ── Body centering on narrow surfaces ──
+    // When the surface is narrow, nudge body toward center to prevent edge overshoot
+    if (this.walk._targetHipScale < 0.95) {
+      const rDist = this.walk._surfaceRightDist;
+      const lDist = this.walk._surfaceLeftDist;
+      const imbalance = rDist - lDist; // positive = more room on right, push right
+      if (Math.abs(imbalance) > 0.05) {
+        _bodyRight.crossVectors(this._bodyUp, _bodyForward).normalize();
+        const nudge = imbalance * 0.5 * Math.min(1, 5 * dt);
+        this.mesh.position.addScaledVector(_bodyRight, nudge);
+      }
+    }
+
+    // ── Joint collision resolution (climb mode only) ──
+    // Prevent spine nodes and body center from penetrating the wall surface
+    // during climbing. Only pushes along the wall normal direction.
+    // Ground mode is excluded — body centering + hip scaling handle narrow surfaces,
+    // and multi-axis probing causes oscillation on narrow wall tops.
+    if (this.walk.climbing) {
+      this.mesh.updateMatrixWorld(true);
+      const skelMW = this.skeleton.group.matrixWorld;
+      const wn = this.walk._climbNormal;
+      let maxPush = 0;
+
+      const testClimbPoint = (wp) => {
+        // Cast from outside the wall toward the point
+        _probeOrig.copy(wp).addScaledVector(wn, JOINT_PROBE_LEN);
+        _probeNeg.copy(wn).negate();
+        _raycaster.set(_probeOrig, _probeNeg);
+        _raycaster.far = JOINT_PROBE_LEN * 2;
+        _pcHitsArray.length = 0;
+        _raycaster.intersectObjects(this.groundMeshes, false, _pcHitsArray);
+        if (_pcHitsArray.length === 0) return;
+
+        const h = _pcHitsArray[0];
+        // Distance from surface to the point along the wall normal
+        _probeOrig.subVectors(wp, h.point);
+        const d = _probeOrig.dot(wn);
+        if (d < JOINT_MIN_CLEARANCE) {
+          const push = JOINT_MIN_CLEARANCE - d;
+          if (push > maxPush) maxPush = push;
+        }
+      };
+
+      // Spine nodes
+      for (const n of this.skeleton.nodes) {
+        _jointW.copy(n).applyMatrix4(skelMW);
+        testClimbPoint(_jointW);
+      }
+      // Body center
+      testClimbPoint(this.mesh.position);
+
+      if (maxPush > 0) {
+        this.mesh.position.addScaledVector(wn, maxPush);
+      }
     }
 
     // ── Apply body noise to skeleton group ──
@@ -367,6 +505,197 @@ export class PlayerController {
     window.removeEventListener('keydown', this._onKeyDown);
     window.removeEventListener('keyup', this._onKeyUp);
     document.removeEventListener('mousemove', this._onMouseMove);
+  }
+
+  /**
+   * Probe for a climbable wall face when walking off an edge.
+   * Casts BACKWARD (opposite to input direction) from below the wall top
+   * to find the side-face the player just walked past.
+   * Returns true and transitions to climbing if a wall is found.
+   */
+  _tryEdgeClimb(candidatePos, inputDir) {
+    if (inputDir.lengthSq() < 0.001) return false;
+
+    // Probe from below the current wall top so the ray hits the side face
+    const probeY = this.mesh.position.y - this.skeleton.spineHeight - 0.5;
+
+    // Try 1: cast BACKWARD — the wall face we walked past is behind us
+    _tmpV3.set(candidatePos.x, probeY, candidatePos.z);
+    _tmpV3b.copy(inputDir).negate().normalize();
+    _raycaster.set(_tmpV3, _tmpV3b);
+    _raycaster.far = 3.0;
+    _pcHitsArray.length = 0;
+    _raycaster.intersectObjects(this.groundMeshes, false, _pcHitsArray);
+    for (let i = 0; i < _pcHitsArray.length; i++) {
+      const h = _pcHitsArray[i];
+      if (!h.object.userData.climbable) continue;
+      _tmpV3.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
+      if (Math.abs(_tmpV3.y) > 0.3) continue; // want a vertical wall face
+      return this._enterClimbFromEdge(h, _tmpV3);
+    }
+
+    // Try 2: cast FORWARD — cliff edge with wall ahead
+    _tmpV3.set(candidatePos.x, probeY, candidatePos.z);
+    _tmpV3b.copy(inputDir).normalize();
+    _raycaster.set(_tmpV3, _tmpV3b);
+    _raycaster.far = 3.0;
+    _pcHitsArray.length = 0;
+    _raycaster.intersectObjects(this.groundMeshes, false, _pcHitsArray);
+    for (let i = 0; i < _pcHitsArray.length; i++) {
+      const h = _pcHitsArray[i];
+      if (!h.object.userData.climbable) continue;
+      _tmpV3.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
+      if (Math.abs(_tmpV3.y) > 0.3) continue;
+      return this._enterClimbFromEdge(h, _tmpV3);
+    }
+
+    return false;
+  }
+
+  /**
+   * Start a two-phase step-down transition from a wall top to the wall face.
+   * Phase 'reach': Body slides to edge, leading legs reach down onto wall.
+   * Phase 'follow': Body moves to wall, trailing legs follow.
+   */
+  _enterClimbFromEdge(hit, wn) {
+    // Compute key positions
+    const bodyPos = this.mesh.position;
+    const spineH = this.skeleton.spineHeight;
+
+    // Edge position: top of the wall face, at the player's current height
+    _edgePos.set(
+      hit.point.x + wn.x * 0.05,
+      bodyPos.y,
+      hit.point.z + wn.z * 0.05
+    );
+
+    // Wall target: on the wall face, one spineHeight below the edge
+    _wallTarget.set(
+      hit.point.x + wn.x * (spineH + 0.15),
+      bodyPos.y - spineH * 1.2,
+      hit.point.z + wn.z * (spineH + 0.15)
+    );
+
+    // Store transition state
+    this._edgeTransition = 'reach';
+    this._edgeTransTimer = 0;
+    this._edgeTransStartPos.copy(bodyPos);
+    this._edgeTransMidPos.copy(_edgePos);
+    this._edgeTransEndPos.copy(_wallTarget);
+    this._edgeTransWallNrm.copy(wn);
+    this._edgeTransStartUp.copy(this._bodyUp);
+    this._edgeTransEndUp.copy(wn);
+
+    // Pre-set climb state so foot placement uses wall-mode casting
+    this.walk.climbing = true;
+    this.walk._climbTime = 0;
+    this.walk._climbNormal.copy(wn);
+    this.walk._climbDir.copy(wn).negate();
+
+    // Compute wall-face foot targets for leading group (A)
+    this._computeWallFootTargets('A', _wallTarget, wn);
+    this.walk.forceStepGroup('A', _legTargets, 0.15);
+
+    return true;
+  }
+
+  /**
+   * Compute 3 foot target positions on the wall face for a given leg group.
+   * Positions are arranged around targetPos on the wall plane.
+   */
+  _computeWallFootTargets(groupName, targetPos, wn) {
+    const group = groupName === 'A' ? this.walk.groupA : this.walk.groupB;
+    // Body axes on the wall
+    _bodyForward.set(0, 0, 1).applyAxisAngle(_yAxis, this.yaw);
+    _bodyForward.sub(_tmpV3.copy(wn).multiplyScalar(_bodyForward.dot(wn)));
+    if (_bodyForward.lengthSq() < 0.001) {
+      _bodyForward.set(1, 0, 0);
+      _bodyForward.sub(_tmpV3.copy(wn).multiplyScalar(_bodyForward.dot(wn)));
+    }
+    _bodyForward.normalize();
+    _bodyRight.crossVectors(wn, _bodyForward).normalize();
+
+    for (let g = 0; g < 3; g++) {
+      const limb = this.walk.limbs[group[g]];
+      // Use home positions scaled by current hipScale, projected onto wall plane
+      const hx = limb.home.x * this.walk._hipScale;
+      const hz = limb.home.z * this.walk._hipScale;
+      _legTargets[g].copy(targetPos)
+        .addScaledVector(_bodyRight, hx)
+        .addScaledVector(_bodyForward, hz);
+      // Place on the actual wall surface
+      _rayOrigin.copy(_legTargets[g]).addScaledVector(wn, 1.5);
+      _raycaster.set(_rayOrigin, _tmpV3.copy(wn).negate());
+      _raycaster.far = 3;
+      _pcHitsArray.length = 0;
+      _raycaster.intersectObjects(this.groundMeshes, false, _pcHitsArray);
+      if (_pcHitsArray.length > 0) {
+        _legTargets[g].copy(_pcHitsArray[0].point).addScaledVector(wn, 0.02);
+      }
+    }
+  }
+
+  /** Advance the two-phase edge transition. Returns true while active. */
+  _updateEdgeTransition(dt) {
+    if (!this._edgeTransition) return false;
+
+    this._edgeTransTimer += dt;
+    const t = Math.min(this._edgeTransTimer / this._edgeTransDuration, 1);
+    // Smooth ease-in-out
+    const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+
+    const wn = this._edgeTransWallNrm;
+
+    if (this._edgeTransition === 'reach') {
+      // Phase 1: Body slides from start to edge, leading legs stepping to wall
+      this.mesh.position.lerpVectors(this._edgeTransStartPos, this._edgeTransMidPos, ease);
+
+      // Smoothly rotate body up from ground-up toward wall normal
+      this._bodyUp.lerpVectors(this._edgeTransStartUp, this._edgeTransEndUp, ease * 0.3).normalize();
+
+      if (t >= 1) {
+        // Phase 1 complete — start phase 2
+        this._edgeTransition = 'follow';
+        this._edgeTransTimer = 0;
+        this._edgeTransStartPos.copy(this.mesh.position);
+
+        // Step trailing group (B) to wall targets
+        this._computeWallFootTargets('B', this._edgeTransEndPos, wn);
+        this.walk.forceStepGroup('B', _legTargets, 0.15);
+      }
+    } else if (this._edgeTransition === 'follow') {
+      // Phase 2: Body moves from edge to wall position, trailing legs following
+      this.mesh.position.lerpVectors(this._edgeTransStartPos, this._edgeTransEndPos, ease);
+
+      // Continue rotating body up toward wall normal
+      const upBlend = 0.3 + 0.7 * ease;
+      this._bodyUp.lerpVectors(this._edgeTransStartUp, this._edgeTransEndUp, upBlend).normalize();
+
+      if (t >= 1) {
+        // Transition complete — finalize climb state
+        this._edgeTransition = null;
+        this.mesh.position.copy(this._edgeTransEndPos);
+        this._bodyUp.copy(wn).normalize();
+        this._targetUp.copy(wn);
+        this.walk._climbTime = 0;
+        this._edgePushTime = 0;
+      }
+    }
+
+    // Update body orientation during transition
+    _bodyForward.set(0, 0, 1).applyAxisAngle(_yAxis, this.yaw);
+    _bodyForward.sub(_tmpV3.copy(this._bodyUp).multiplyScalar(_bodyForward.dot(this._bodyUp)));
+    if (_bodyForward.lengthSq() < 0.001) {
+      _bodyForward.set(1, 0, 0).applyAxisAngle(_yAxis, this.yaw);
+      _bodyForward.sub(_tmpV3.copy(this._bodyUp).multiplyScalar(_bodyForward.dot(this._bodyUp)));
+    }
+    _bodyForward.normalize();
+    _bodyRight.crossVectors(this._bodyUp, _bodyForward).normalize();
+    _bodyForward.crossVectors(_bodyRight, this._bodyUp).normalize();
+    _rotMat.makeBasis(_bodyRight, this._bodyUp, _bodyForward);
+    this.mesh.quaternion.setFromRotationMatrix(_rotMat);
+
+    return true;
   }
 }
 
