@@ -32,7 +32,12 @@ export class CameraController {
     // ── Smooth follow ──
     this.smoothSpeed = 8;          // higher = snappier (units: 1/s)
     this._currentPos = new THREE.Vector3();
+    this._currentLookTarget = new THREE.Vector3();
     this._initialised = false;     // snap on first frame
+
+    // ── Velocity clamping (absorbs body spikes) ──
+    this.maxCamSpeed = 18;         // max units/s the camera can travel
+    this.maxLookSpeed = 12;        // max units/s the look-target can travel
 
     // ── Occlusion fade ──
     this._raycaster = new THREE.Raycaster();
@@ -75,19 +80,39 @@ export class CameraController {
     // ── 2. Occlusion fade ──
     this._updateOcclusionFade(lookTarget, desiredPos, dt);
 
-    // ── 3. Smooth follow (lerp toward desired) ──
+    // ── 3. Smooth follow with velocity clamping ──
+    // The exponential lerp gives a smooth spring-like feel, while the velocity
+    // clamp prevents sudden body spikes from jerking the camera.
     if (!this._initialised) {
       this._currentPos.copy(desiredPos);
+      this._currentLookTarget.copy(lookTarget);
       this._initialised = true;
     } else {
       const alpha = 1 - Math.exp(-this.smoothSpeed * dt);
-      this._currentPos.lerp(desiredPos, alpha);
+
+      // Position: lerp then clamp displacement per frame
+      _tmpVec.copy(desiredPos).sub(this._currentPos).multiplyScalar(alpha);
+      const posDist = _tmpVec.length();
+      const maxPosDelta = this.maxCamSpeed * dt;
+      if (posDist > maxPosDelta) {
+        _tmpVec.multiplyScalar(maxPosDelta / posDist);
+      }
+      this._currentPos.add(_tmpVec);
+
+      // Look-target: same treatment
+      _tmpVec.copy(lookTarget).sub(this._currentLookTarget).multiplyScalar(alpha);
+      const lookDist = _tmpVec.length();
+      const maxLookDelta = this.maxLookSpeed * dt;
+      if (lookDist > maxLookDelta) {
+        _tmpVec.multiplyScalar(maxLookDelta / lookDist);
+      }
+      this._currentLookTarget.add(_tmpVec);
     }
 
     this.camera.position.copy(this._currentPos);
 
     // ── 4. Look at player ──
-    this.camera.lookAt(lookTarget);
+    this.camera.lookAt(this._currentLookTarget);
 
     // Apply Leva-driven pan / tilt tweaks
     this.camera.rotation.y += THREE.MathUtils.degToRad(this.pan);

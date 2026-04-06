@@ -13,6 +13,8 @@ import { useControls, button } from 'leva';
 import { PlayerController, setRendererDomElement } from './PlayerController.js';
 import { CameraController } from './CameraController.js';
 import { ClimbDebugVis } from './ClimbDebugVis.js';
+import { RayDebugLogger, setRayDebugLogger } from './RayDebugLogger.js';
+import { RayDebugOverlay } from './DebugOverlay.jsx';
 import { exportSkeletonGLB, loadCustomGeoGLB } from './SkeletonIO.js';
 
 // ───────────────────────────────────────────────
@@ -218,6 +220,15 @@ const wallMat = new THREE.MeshStandardMaterial({ color: 0x7c6f64, roughness: 0.7
         child.castShadow = true;
         child.receiveShadow = true;
         child.userData.climbable = true;
+        // Ensure raycasts hit from both sides — even thick manifold meshes
+        // can have grazing-angle misses with FrontSide-only raycasting
+        if (child.material) {
+          if (Array.isArray(child.material)) {
+            child.material.forEach(m => { m.side = THREE.DoubleSide; });
+          } else {
+            child.material.side = THREE.DoubleSide;
+          }
+        }
         // Build BVH for fast trimesh raycasting on complex geometry
         child.geometry.computeBoundsTree();
         groundMeshes.push(child);
@@ -236,6 +247,8 @@ const player = new PlayerController(scene);
 player.setGroundMeshes(groundMeshes);
 const camCtrl = new CameraController(camera, player);
 const climbDebug = new ClimbDebugVis(scene);
+const rayLogger = new RayDebugLogger(scene);
+setRayDebugLogger(rayLogger);
 
 // ── Pointer lock on canvas click ──
 renderer.domElement.addEventListener('click', () => {
@@ -256,6 +269,7 @@ function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);
 
+  rayLogger.beginFrame(dt);
   player.update(dt);
   climbDebug.update(player.walk, player.mesh.position);
   camCtrl.update();
@@ -277,11 +291,17 @@ function LevaPanel() {
   // ── Climb Debug Vis ──
   const debug = useControls('Debug', {
     'Climb Rays': { value: true },
+    'Ray Logger': { value: false },
   });
 
   useEffect(() => {
     climbDebug.enabled = debug['Climb Rays'];
   }, [debug['Climb Rays']]);
+
+  useEffect(() => {
+    rayLogger.enabled = debug['Ray Logger'];
+    if (!debug['Ray Logger']) rayLogger.hideAll();
+  }, [debug['Ray Logger']]);
 
   // ── Camera ──
   const cameraOffset = useControls('Camera Offset', {
@@ -478,7 +498,24 @@ function LevaPanel() {
     bn.lateralDamping = noiseBias['Lateral Damping'];
   }, [noiseBias['Fwd Tilt'], noiseBias['Bwd Tilt'], noiseBias['Move Damping'], noiseBias['Lateral Damping']]);
 
-  return null;
+  // ── Jump ──
+  const jumpCtrl = useControls('Jump', {
+    'Strength':     { value: 28.0,  min: 0.5, max: 100.0, step: 0.5 },
+    'Gravity':      { value: 52.8,  min: 1.0, max: 100.0, step: 0.5 },
+    'Terminal Vel': { value: 20.0,  min: 5.0, max: 60.0,  step: 1.0 },
+    'Air Steer':    { value: 35.0,  min: 0.0, max: 100.0, step: 0.5 },
+    'Latch Radius': { value: 2.0,  min: 0.5, max: 6.0,  step: 0.25 },
+  });
+
+  useEffect(() => {
+    player.jumpStrength    = jumpCtrl['Strength'];
+    player.jumpGravity     = jumpCtrl['Gravity'];
+    player.jumpTerminalVel = jumpCtrl['Terminal Vel'];
+    player.jumpAirSteer    = jumpCtrl['Air Steer'];
+    player.jumpLatchRadius = jumpCtrl['Latch Radius'];
+  }, [jumpCtrl['Strength'], jumpCtrl['Gravity'], jumpCtrl['Terminal Vel'], jumpCtrl['Air Steer'], jumpCtrl['Latch Radius']]);
+
+  return <RayDebugOverlay logger={rayLogger} />;
 }
 
 const guiRoot = document.createElement('div');
