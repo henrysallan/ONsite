@@ -32,11 +32,15 @@ const _toFoot = new THREE.Vector3();
 const _knee = new THREE.Vector3();
 
 // Shared materials
-const spineMat  = new THREE.MeshStandardMaterial({ color: 0xe2e8f0 });
-const hipMat    = new THREE.MeshStandardMaterial({ color: 0x94a3b8 });
-const legMat    = new THREE.MeshStandardMaterial({ color: 0x64748b });
-const jointMat  = new THREE.MeshStandardMaterial({ color: 0xfbbf24 });
-const footMat   = new THREE.MeshStandardMaterial({ color: 0xef4444 });
+const spineMat  = new THREE.MeshStandardMaterial({ color: 0xffffff });
+const hipMat    = new THREE.MeshStandardMaterial({ color: 0xffffff });
+const legMat    = new THREE.MeshStandardMaterial({ color: 0xffffff });
+const jointMat  = new THREE.MeshStandardMaterial({ color: 0xffffff });
+const footMat   = new THREE.MeshStandardMaterial({ color: 0xffffff });
+const gunMat    = new THREE.MeshStandardMaterial({ color: 0xffffff });
+
+// Reusable temporary for gun limb rest-pose target
+const _gunTarget = new THREE.Vector3();
 
 /** Create a tube (cylinder) mesh between two local-space points. */
 function createBoneMesh(from, to, material) {
@@ -103,10 +107,15 @@ export class PlayerSkeleton {
     this.legLength   = opts.legLength   ?? 0.8;
     this.spineHeight = opts.spineHeight ?? 0.70;
 
-    // Per-bone lengths: 2 spines, 6 hips (L0,R0,L1,R1,L2,R2), 6 legs (same order)
-    this.spineLengths = [this.spineLength, this.spineLength];
+    // Per-bone lengths: 4 spines, 6 hips (L0,R0,L1,R1,L2,R2), 6 legs (same order)
+    this.spineLengths = [this.spineLength / 2, this.spineLength / 2, this.spineLength / 2, this.spineLength / 2];
     this.hipLengths   = [1.10, 0.80, 1.00, 0.95, 0.90, 1.15];
     this.legLengths   = [1.05, 1.15, 1.20, 1.15, 1.30, 1.40];
+
+    // Gun limb lengths (upper extends up from spine, lower bends forward)
+    this.gunUpperLength = opts.gunUpperLength ?? 0.6;
+    this.gunLowerLength = opts.gunLowerLength ?? 0.5;
+    this.gunUpperAngle  = opts.gunUpperAngle  ?? 30; // degrees from vertical toward forward
 
     this.group = new THREE.Group();
     this._boneMeshes = [];
@@ -133,22 +142,31 @@ export class PlayerSkeleton {
 
     const S1 = this.spineLengths[0];
     const S2 = this.spineLengths[1];
+    const S3 = this.spineLengths[2];
+    const S4 = this.spineLengths[3];
     const Y = this.spineHeight;
 
     // ── Node positions (local space, spine along +Z) ──
-    const node0 = new THREE.Vector3(0, Y, -S1);
-    const node1 = new THREE.Vector3(0, Y,  0);
-    const node2 = new THREE.Vector3(0, Y,  S2);
-    this.nodes = [node0, node1, node2];
+    // 5 nodes: limbs attach at 0, 2, 4 (1st, 3rd, 5th)
+    const node0 = new THREE.Vector3(0, Y, -(S1 + S2));
+    const node1 = new THREE.Vector3(0, Y, -S2);
+    const node2 = new THREE.Vector3(0, Y,  0);
+    const node3 = new THREE.Vector3(0, Y,  S3);
+    const node4 = new THREE.Vector3(0, Y,  S3 + S4);
+    this.nodes = [node0, node1, node2, node3, node4];
 
-    // ── Spine bones ──
+    // ── Spine bones (4 segments) ──
     this._addBone(node0, node1, spineMat, 'spine1');
     this._addBone(node1, node2, spineMat, 'spine2');
+    this._addBone(node2, node3, spineMat, 'spine3');
+    this._addBone(node3, node4, spineMat, 'spine4');
 
-    // ── Hips + Legs at each node ──
-    // limbData ordering: L0, R0, L1, R1, L2, R2  (limbIdx = i*2 for L, i*2+1 for R)
+    // ── Hips + Legs at limb nodes (0, 2, 4) ──
+    // limbData ordering: L0, R0, L1, R1, L2, R2
+    const limbNodes = [0, 2, 4];
     for (let i = 0; i < 3; i++) {
-      const n = this.nodes[i];
+      const nodeIdx = limbNodes[i];
+      const n = this.nodes[nodeIdx];
       const limbIdxL = i * 2;
       const limbIdxR = i * 2 + 1;
 
@@ -164,7 +182,7 @@ export class PlayerSkeleton {
       const fL = this._addJoint(legLEnd, footMat); // foot
 
       this.limbData.push({
-        nodeIndex: i, side: 'L',
+        nodeIndex: nodeIdx, side: 'L',
         hipBone: this.bones[`hip_L${i}`],
         legBone: this.bones[`leg_L${i}`],
         kneeJoint: jL,
@@ -183,7 +201,7 @@ export class PlayerSkeleton {
       const fR = this._addJoint(legREnd, footMat);
 
       this.limbData.push({
-        nodeIndex: i, side: 'R',
+        nodeIndex: nodeIdx, side: 'R',
         hipBone: this.bones[`hip_R${i}`],
         legBone: this.bones[`leg_R${i}`],
         kneeJoint: jR,
@@ -191,7 +209,23 @@ export class PlayerSkeleton {
       });
     }
 
-    // Joint spheres at the 3 spine nodes
+    // ── Gun limb at 2nd node (node1) ──
+    const gunUpperEnd = new THREE.Vector3(node1.x, node1.y + this.gunUpperLength, node1.z);
+    const gunLowerEnd = new THREE.Vector3(gunUpperEnd.x, gunUpperEnd.y, gunUpperEnd.z + this.gunLowerLength);
+    this._addBone(node1, gunUpperEnd, gunMat, 'gun_upper');
+    this._addBone(gunUpperEnd, gunLowerEnd, gunMat, 'gun_lower');
+    const gunElbow = this._addJoint(gunUpperEnd);
+    const gunTip = this._addJoint(gunLowerEnd);
+
+    this.gunData = {
+      nodeIndex: 1,
+      upperBone: this.bones['gun_upper'],
+      lowerBone: this.bones['gun_lower'],
+      elbowJoint: gunElbow,
+      tipJoint: gunTip,
+    };
+
+    // Joint spheres at the 5 spine nodes
     for (const n of this.nodes) {
       this._addJoint(n);
     }
@@ -229,6 +263,67 @@ export class PlayerSkeleton {
     // Update joint spheres
     ld.kneeJoint.position.copy(_knee);
     ld.footJoint.position.copy(footPosLocal);
+  }
+
+  /**
+   * Update the gun limb using 2-bone IK. tipPosLocal is in SKELETON-LOCAL space.
+   */
+  updateGunLimb(tipPosLocal) {
+    const gd = this.gunData;
+    if (!gd) return;
+    const root = this.nodes[gd.nodeIndex];
+
+    // Pole hint: backward (-Z) so the elbow bends upward
+    _poleHint.set(0, 0, -1);
+
+    const upperLen = this.gunUpperLength;
+    const lowerLen = this.gunLowerLength;
+    const maxReach = (upperLen + lowerLen) * 0.98;
+
+    _toFoot.subVectors(tipPosLocal, root);
+    const dist = _toFoot.length();
+    if (dist > maxReach) {
+      _toFoot.multiplyScalar(maxReach / dist);
+      tipPosLocal.copy(root).add(_toFoot);
+    }
+
+    solve2BoneIK(root, tipPosLocal, upperLen, lowerLen, _poleHint, _knee);
+
+    updateBoneMesh(gd.upperBone.mesh, root, _knee);
+    updateBoneMesh(gd.lowerBone.mesh, _knee, tipPosLocal);
+
+    gd.elbowJoint.position.copy(_knee);
+    gd.tipJoint.position.copy(tipPosLocal);
+  }
+
+  /**
+   * Update the gun limb to its default rest pose (extends up, bends forward).
+   * Call once per frame after updating walking limbs.
+   */
+  updateGunRest() {
+    if (!this.gunData) return;
+    const root = this.nodes[this.gunData.nodeIndex];
+    const totalReach = this.gunUpperLength + this.gunLowerLength;
+    // Upper limb direction: angle from vertical (+Y) toward forward (+Z)
+    const rad = this.gunUpperAngle * Math.PI / 180;
+    const upComp = Math.cos(rad) * totalReach * 0.7;
+    const fwdComp = Math.sin(rad) * totalReach * 0.7 + totalReach * 0.3;
+    _gunTarget.set(root.x, root.y + upComp, root.z + fwdComp);
+    this.updateGunLimb(_gunTarget);
+  }
+
+  /**
+   * Get the gun tip position in world space.
+   * Call after updateGunRest / updateGunLimb and after the skeleton group's
+   * matrixWorld has been updated.
+   * @param {THREE.Vector3} out – result written here
+   * @returns {THREE.Vector3}
+   */
+  getGunTipWorld(out) {
+    if (!this.gunData) return out.set(0, 0, 0);
+    out.copy(this.gunData.tipJoint.position);
+    this.group.localToWorld(out);
+    return out;
   }
 
   _addBone(from, to, mat, name) {

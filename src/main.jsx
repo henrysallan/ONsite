@@ -6,16 +6,21 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
-import React, { useEffect } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { useControls, button } from 'leva';
 
+import { PostProcessing } from './PostProcessing.js';
+import { defaultRampStops } from './CelShadingPass.js';
+import { ColorRampEditor } from './ColorRampEditor.jsx';
 import { PlayerController, setRendererDomElement } from './PlayerController.js';
 import { CameraController } from './CameraController.js';
 import { ClimbDebugVis } from './ClimbDebugVis.js';
 import { RayDebugLogger, setRayDebugLogger } from './RayDebugLogger.js';
 import { RayDebugOverlay } from './DebugOverlay.jsx';
 import { exportSkeletonGLB, loadCustomGeoGLB } from './SkeletonIO.js';
+import { BulletSystem } from './BulletSystem.js';
+import { SparkSystem } from './SparkSystem.js';
 
 // ───────────────────────────────────────────────
 // Three.js setup (module-level singletons)
@@ -25,14 +30,16 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+THREE.ColorManagement.enabled = false;
+renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 document.body.appendChild(renderer.domElement);
 
 // Let the player controller know which element has pointer lock
 setRendererDomElement(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x87ceeb);
-scene.fog = new THREE.Fog(0x87ceeb, 40, 120);
+scene.background = new THREE.Color(0xffffff);
+scene.fog = new THREE.Fog(0xffffff, 40, 120);
 
 const camera = new THREE.PerspectiveCamera(
   60,
@@ -40,6 +47,9 @@ const camera = new THREE.PerspectiveCamera(
   0.1,
   500
 );
+
+// ── Post-processing pipeline ──
+const postFX = new PostProcessing(renderer, scene, camera);
 
 // ── Lighting ──
 scene.add(new THREE.AmbientLight(0xffffff, 0.5));
@@ -57,20 +67,20 @@ scene.add(dirLight);
 // ── Ground plane ──
 const ground = new THREE.Mesh(
   new THREE.PlaneGeometry(200, 200),
-  new THREE.MeshStandardMaterial({ color: 0x4ade80, roughness: 0.9 })
+  new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 })
 );
 ground.rotation.x = -Math.PI / 2;
 ground.receiveShadow = true;
 scene.add(ground);
 
-const grid = new THREE.GridHelper(200, 80, 0x228833, 0x228833);
+const grid = new THREE.GridHelper(200, 80, 0xcccccc, 0xcccccc);
 grid.position.y = 0.01;
 grid.material.opacity = 0.3;
 grid.material.transparent = true;
 scene.add(grid);
 
 // ── Terrain: ramps and hills ──
-const terrainMat = new THREE.MeshStandardMaterial({ color: 0x8b7355, roughness: 0.85 });
+const terrainMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.85 });
 ground.geometry.computeBoundsTree();
 const groundMeshes = [ground]; // collect all walkable surfaces
 
@@ -129,7 +139,7 @@ const groundMeshes = [ground]; // collect all walkable surfaces
   }
   geo.computeVertexNormals();
   geo.computeBoundsTree();
-  const hillMat = new THREE.MeshStandardMaterial({ color: 0x6b8e23, roughness: 0.9 });
+  const hillMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 });
   const hill = new THREE.Mesh(geo, hillMat);
   hill.rotation.x = -Math.PI / 2;
   hill.position.set(12, 0, -12);
@@ -159,7 +169,7 @@ const groundMeshes = [ground]; // collect all walkable surfaces
 }
 
 // ── Climbable walls ──
-const wallMat = new THREE.MeshStandardMaterial({ color: 0x7c6f64, roughness: 0.75 });
+const wallMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.75 });
 
 // Wall 1 – tall vertical wall facing +X
 {
@@ -220,13 +230,26 @@ const wallMat = new THREE.MeshStandardMaterial({ color: 0x7c6f64, roughness: 0.7
         child.castShadow = true;
         child.receiveShadow = true;
         child.userData.climbable = true;
-        // Ensure raycasts hit from both sides — even thick manifold meshes
-        // can have grazing-angle misses with FrontSide-only raycasting
+        // FrontSide is sufficient with BVH (three-mesh-bvh) for precise
+        // ray-triangle tests. DoubleSide caused raycasts to hit interior
+        // surfaces, letting the player walk inside manifold meshes.
         if (child.material) {
+          const normMat = (m) => {
+            m.color.set(0xffffff);
+            m.side = THREE.FrontSide;
+            m.roughness = 0.9;
+            m.metalness = 0;
+            m.emissive?.set(0x000000);
+            if (m.emissiveMap) { m.emissiveMap = null; }
+            if (m.metalnessMap) { m.metalnessMap = null; }
+            if (m.roughnessMap) { m.roughnessMap = null; }
+            if (m.map) { m.map = null; }
+            m.needsUpdate = true;
+          };
           if (Array.isArray(child.material)) {
-            child.material.forEach(m => { m.side = THREE.DoubleSide; });
+            child.material.forEach(normMat);
           } else {
-            child.material.side = THREE.DoubleSide;
+            normMat(child.material);
           }
         }
         // Build BVH for fast trimesh raycasting on complex geometry
@@ -246,9 +269,60 @@ const wallMat = new THREE.MeshStandardMaterial({ color: 0x7c6f64, roughness: 0.7
 const player = new PlayerController(scene);
 player.setGroundMeshes(groundMeshes);
 const camCtrl = new CameraController(camera, player);
+camCtrl.setGroundMeshes([ground]);
 const climbDebug = new ClimbDebugVis(scene);
 const rayLogger = new RayDebugLogger(scene);
 setRayDebugLogger(rayLogger);
+
+// ── Bullet system ──
+const sparks = new SparkSystem(scene);
+const bullets = new BulletSystem(scene, groundMeshes);
+bullets.sparks = sparks;
+const _aimRaycaster = new THREE.Raycaster();
+const _aimDir = new THREE.Vector3();
+const _gunTipW = new THREE.Vector3();
+const _aimPoint = new THREE.Vector3();
+const _screenCenter = new THREE.Vector2(0, 0); // NDC center
+
+// ── Continuous fire state ──
+let _firing = false;
+let _fireCooldown = 0;
+
+function fireBullet() {
+  // 1. Raycast from camera through screen center to find aim point
+  _aimRaycaster.setFromCamera(_screenCenter, camera);
+  _aimRaycaster.far = 500;
+  const hits = _aimRaycaster.intersectObjects(groundMeshes, false);
+  if (hits.length > 0) {
+    _aimPoint.copy(hits[0].point);
+  } else {
+    _aimPoint.copy(_aimRaycaster.ray.direction).multiplyScalar(200).add(_aimRaycaster.ray.origin);
+  }
+
+  // 2. Get gun tip in world space
+  player.skeleton.group.updateMatrixWorld(true);
+  player.skeleton.getGunTipWorld(_gunTipW);
+
+  // 3. Direction from gun tip toward aim point
+  _aimDir.subVectors(_aimPoint, _gunTipW).normalize();
+
+  // 4. Fire!
+  bullets.fire(_gunTipW, _aimDir);
+}
+
+renderer.domElement.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  if (document.pointerLockElement !== renderer.domElement) return;
+  _firing = true;
+  _fireCooldown = 0; // fire immediately on first click
+});
+renderer.domElement.addEventListener('mouseup', (e) => {
+  if (e.button !== 0) return;
+  _firing = false;
+});
+document.addEventListener('pointerlockchange', () => {
+  if (document.pointerLockElement !== renderer.domElement) _firing = false;
+});
 
 // ── Pointer lock on canvas click ──
 renderer.domElement.addEventListener('click', () => {
@@ -260,6 +334,7 @@ window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  postFX.setSize(window.innerWidth, window.innerHeight);
 });
 
 // ── Game loop ──
@@ -271,9 +346,21 @@ function animate() {
 
   rayLogger.beginFrame(dt);
   player.update(dt);
+
+  // Continuous fire
+  if (_firing) {
+    _fireCooldown -= dt;
+    if (_fireCooldown <= 0) {
+      fireBullet();
+      _fireCooldown = 1 / bullets.fireRate;
+    }
+  }
+
+  bullets.update(dt);
+  sparks.update(dt);
   climbDebug.update(player.walk, player.mesh.position);
   camCtrl.update();
-  renderer.render(scene, camera);
+  postFX.render(dt);
 }
 
 animate();
@@ -306,14 +393,15 @@ function LevaPanel() {
   // ── Camera ──
   const cameraOffset = useControls('Camera Offset', {
     X: { value: 0, min: -20, max: 20, step: 0.1 },
-    Y: { value: 3, min: 0, max: 30, step: 0.1 },
-    Z: { value: -6, min: -30, max: 0, step: 0.1 },
+    Y: { value: 0.7, min: 0, max: 30, step: 0.1 },
+    Z: { value: -4.1, min: -30, max: 0, step: 0.1 },
   });
 
   const cameraSettings = useControls('Camera', {
     Pan:  { value: 0, min: -90, max: 90, step: 0.5 },
     Tilt: { value: 0, min: -45, max: 90, step: 0.5 },
-    FOV:  { value: 60, min: 20, max: 120, step: 1 },
+    FOV:  { value: 95, min: 20, max: 120, step: 1 },
+    'Orbit Sensitivity': { value: 0.002, min: 0.0005, max: 0.01, step: 0.0005 },
   });
 
   useEffect(() => {
@@ -325,12 +413,37 @@ function LevaPanel() {
   useEffect(() => {
     camCtrl.pan = cameraSettings.Pan;
     camCtrl.tilt = cameraSettings.Tilt;
-  }, [cameraSettings.Pan, cameraSettings.Tilt]);
+    player.mouseSensitivity = cameraSettings['Orbit Sensitivity'];
+  }, [cameraSettings.Pan, cameraSettings.Tilt, cameraSettings['Orbit Sensitivity']]);
 
   useEffect(() => {
     camera.fov = cameraSettings.FOV;
     camera.updateProjectionMatrix();
   }, [cameraSettings.FOV]);
+
+  const postPos = useControls('Camera Post-Offset (Position)', {
+    X: { value: 2.6, min: -10, max: 10, step: 0.05 },
+    Y: { value: -0.9, min: -10, max: 10, step: 0.05 },
+    Z: { value: -0.1, min: -10, max: 10, step: 0.05 },
+  });
+
+  const postRot = useControls('Camera Post-Offset (Rotation)', {
+    Pitch: { value: 0, min: -90, max: 90, step: 0.5 },
+    Yaw:   { value: 0, min: -90, max: 90, step: 0.5 },
+    Roll:  { value: 0, min: -45, max: 45, step: 0.5 },
+  });
+
+  useEffect(() => {
+    camCtrl.postOffsetX = postPos.X;
+    camCtrl.postOffsetY = postPos.Y;
+    camCtrl.postOffsetZ = postPos.Z;
+  }, [postPos.X, postPos.Y, postPos.Z]);
+
+  useEffect(() => {
+    camCtrl.postRotX = postRot.Pitch;
+    camCtrl.postRotY = postRot.Yaw;
+    camCtrl.postRotZ = postRot.Roll;
+  }, [postRot.Pitch, postRot.Yaw, postRot.Roll]);
 
   // ── Gait ──
   const gait = useControls('Gait', {
@@ -354,15 +467,36 @@ function LevaPanel() {
 
   // ── Spine bones ──
   const spines = useControls('Spine Bones', {
-    'Spine 1 (rear)':  { value: 0.8, min: 0.1, max: 3.0, step: 0.05 },
-    'Spine 2 (front)': { value: 0.8, min: 0.1, max: 3.0, step: 0.05 },
+    'Spine 1': { value: 0.4, min: 0.1, max: 3.0, step: 0.05 },
+    'Spine 2': { value: 0.4, min: 0.1, max: 3.0, step: 0.05 },
+    'Spine 3': { value: 0.4, min: 0.1, max: 3.0, step: 0.05 },
+    'Spine 4': { value: 0.4, min: 0.1, max: 3.0, step: 0.05 },
   });
 
   useEffect(() => {
-    skel.spineLengths[0] = spines['Spine 1 (rear)'];
-    skel.spineLengths[1] = spines['Spine 2 (front)'];
+    skel.spineLengths[0] = spines['Spine 1'];
+    skel.spineLengths[1] = spines['Spine 2'];
+    skel.spineLengths[2] = spines['Spine 3'];
+    skel.spineLengths[3] = spines['Spine 4'];
     skel.build();
-  }, [spines['Spine 1 (rear)'], spines['Spine 2 (front)']]);
+  }, [spines['Spine 1'], spines['Spine 2'], spines['Spine 3'], spines['Spine 4']]);
+
+  // ── Gun limb ──
+  const gunCtrl = useControls('Gun Limb', {
+    'Upper Length': { value: 0.6, min: 0.1, max: 3.0, step: 0.05 },
+    'Lower Length': { value: 0.5, min: 0.1, max: 3.0, step: 0.05 },
+    'Upper Angle':  { value: 30, min: -90, max: 90, step: 1 },
+  });
+
+  useEffect(() => {
+    skel.gunUpperLength = gunCtrl['Upper Length'];
+    skel.gunLowerLength = gunCtrl['Lower Length'];
+    skel.build();
+  }, [gunCtrl['Upper Length'], gunCtrl['Lower Length']]);
+
+  useEffect(() => {
+    skel.gunUpperAngle = gunCtrl['Upper Angle'];
+  }, [gunCtrl['Upper Angle']]);
 
   // ── Hip bones ──
   const hips = useControls('Hip Bones', {
@@ -498,24 +632,237 @@ function LevaPanel() {
     bn.lateralDamping = noiseBias['Lateral Damping'];
   }, [noiseBias['Fwd Tilt'], noiseBias['Bwd Tilt'], noiseBias['Move Damping'], noiseBias['Lateral Damping']]);
 
+  // ── Sun ──
+  const sunCtrl = useControls('Sun', {
+    Height: { value: 60, min: 5, max: 90, step: 1 },
+    Angle:  { value: 45, min: 0, max: 360, step: 1 },
+    Intensity: { value: 1.0, min: 0, max: 3, step: 0.05 },
+  });
+
+  useEffect(() => {
+    const dist = 25;
+    const heightRad = (sunCtrl.Height * Math.PI) / 180;
+    const angleRad = (sunCtrl.Angle * Math.PI) / 180;
+    const y = Math.sin(heightRad) * dist;
+    const horiz = Math.cos(heightRad) * dist;
+    const x = Math.cos(angleRad) * horiz;
+    const z = Math.sin(angleRad) * horiz;
+    dirLight.position.set(x, y, z);
+    dirLight.intensity = sunCtrl.Intensity;
+  }, [sunCtrl.Height, sunCtrl.Angle, sunCtrl.Intensity]);
+
+  // ── Cel Shading ──
+  const [rampStops, setRampStops] = useState(defaultRampStops());
+
+  const celCtrl = useControls('Cel Shading', {
+    Enabled:   { value: true },
+    Intensity: { value: 1.0, min: 0, max: 1, step: 0.05 },
+    Levels:    { value: 4, min: 0, max: 20, step: 1 },
+    'Add Level': button(() => {
+      // Increase the levels count by 1
+      const cur = postFX.celPass.levels;
+      postFX.celPass.levels = cur + 1;
+    }),
+  });
+
+  useEffect(() => {
+    postFX.celPass.enabled = celCtrl.Enabled;
+    postFX.celPass.intensity = celCtrl.Intensity;
+    postFX.celPass.levels = celCtrl.Levels;
+  }, [celCtrl.Enabled, celCtrl.Intensity, celCtrl.Levels]);
+
+  const onRampChange = useCallback((newStops) => {
+    setRampStops(newStops);
+    postFX.celPass.setStops(newStops);
+  }, []);
+
+  // ── Line Art ──
+  const lineCtrl = useControls('Line Art', {
+    Enabled:          { value: true },
+    Intensity:        { value: 1.0,  min: 0, max: 1, step: 0.05 },
+    Thickness:        { value: 1.0,  min: 0.5, max: 5, step: 0.25 },
+    'Depth Threshold':  { value: 0.05, min: 0.001, max: 0.5, step: 0.005 },
+    'Normal Threshold': { value: 1.0,  min: 0.05, max: 2.0, step: 0.05 },
+    'Shadow Threshold': { value: 0.15, min: 0.01, max: 1.0, step: 0.01 },
+    'Line Color':       { value: '#000000' },
+  });
+
+  useEffect(() => {
+    postFX.outlinePass.enabled = lineCtrl.Enabled;
+    postFX.outlinePass.intensity = lineCtrl.Intensity;
+    postFX.outlinePass.thickness = lineCtrl.Thickness;
+    postFX.outlinePass.depthThreshold = lineCtrl['Depth Threshold'];
+    postFX.outlinePass.normalThreshold = lineCtrl['Normal Threshold'];
+    postFX.outlinePass.shadowThreshold = lineCtrl['Shadow Threshold'];
+    postFX.outlinePass.lineColor = lineCtrl['Line Color'];
+  }, [lineCtrl.Enabled, lineCtrl.Intensity, lineCtrl.Thickness, lineCtrl['Depth Threshold'], lineCtrl['Normal Threshold'], lineCtrl['Shadow Threshold'], lineCtrl['Line Color']]);
+
   // ── Jump ──
   const jumpCtrl = useControls('Jump', {
-    'Strength':     { value: 28.0,  min: 0.5, max: 100.0, step: 0.5 },
-    'Gravity':      { value: 52.8,  min: 1.0, max: 100.0, step: 0.5 },
-    'Terminal Vel': { value: 20.0,  min: 5.0, max: 60.0,  step: 1.0 },
-    'Air Steer':    { value: 35.0,  min: 0.0, max: 100.0, step: 0.5 },
-    'Latch Radius': { value: 2.0,  min: 0.5, max: 6.0,  step: 0.25 },
+    'Strength':      { value: 39.0,  min: 0.5, max: 100.0, step: 0.5 },
+    'Min Strength':  { value: 13.0,   min: 0.5, max: 50.0,  step: 0.5 },
+    'Charge Rate':   { value: 117.0,  min: 5.0, max: 200.0, step: 1.0 },
+    'Gravity':       { value: 52.8,  min: 1.0, max: 100.0, step: 0.5 },
+    'Terminal Vel':  { value: 20.0,  min: 5.0, max: 60.0,  step: 1.0 },
+    'Air Steer':     { value: 35.0,  min: 0.0, max: 100.0, step: 0.5 },
+    'Latch Radius':  { value: 2.0,   min: 0.5, max: 6.0,   step: 0.25 },
   });
 
   useEffect(() => {
     player.jumpStrength    = jumpCtrl['Strength'];
+    player.jumpMinStrength = Math.min(jumpCtrl['Min Strength'], jumpCtrl['Strength']);
+    player.jumpChargeRate  = jumpCtrl['Charge Rate'];
     player.jumpGravity     = jumpCtrl['Gravity'];
     player.jumpTerminalVel = jumpCtrl['Terminal Vel'];
     player.jumpAirSteer    = jumpCtrl['Air Steer'];
     player.jumpLatchRadius = jumpCtrl['Latch Radius'];
-  }, [jumpCtrl['Strength'], jumpCtrl['Gravity'], jumpCtrl['Terminal Vel'], jumpCtrl['Air Steer'], jumpCtrl['Latch Radius']]);
+  }, [jumpCtrl['Strength'], jumpCtrl['Min Strength'], jumpCtrl['Charge Rate'], jumpCtrl['Gravity'], jumpCtrl['Terminal Vel'], jumpCtrl['Air Steer'], jumpCtrl['Latch Radius']]);
 
-  return <RayDebugOverlay logger={rayLogger} />;
+  // ── Bullets ──
+  const bulletCtrl = useControls('Bullets', {
+    'Fire Rate':    { value: 18,   min: 1,     max: 30,  step: 1 },
+    'Spawn Offset': { value: 1.0,  min: 0,     max: 5.0, step: 0.1 },
+    Speed:          { value: 60,   min: 10,    max: 200, step: 5 },
+    Lifetime:       { value: 0.60, min: 0.1,   max: 3.0, step: 0.05 },
+    Width:          { value: 0.04, min: 0.005, max: 0.3, step: 0.005 },
+    Length:         { value: 0.1,  min: 0.1,   max: 5.0, step: 0.1 },
+    Color:          { value: '#747474' },
+  });
+
+  useEffect(() => {
+    bullets.fireRate    = bulletCtrl['Fire Rate'];
+    bullets.spawnOffset = bulletCtrl['Spawn Offset'];
+    bullets.speed       = bulletCtrl.Speed;
+    bullets.lifetime    = bulletCtrl.Lifetime;
+    bullets.width       = bulletCtrl.Width;
+    bullets.length      = bulletCtrl.Length;
+    bullets.color.set(bulletCtrl.Color);
+  }, [bulletCtrl['Fire Rate'], bulletCtrl['Spawn Offset'], bulletCtrl.Speed, bulletCtrl.Lifetime, bulletCtrl.Width, bulletCtrl.Length, bulletCtrl.Color]);
+
+  // ── Sparks ──
+  const sparkCtrl = useControls('Sparks', {
+    Count:    { value: 25,   min: 1,   max: 40,   step: 1 },
+    Speed:    { value: 19.0, min: 1,   max: 30,   step: 0.5 },
+    Gravity:  { value: 29,   min: 0,   max: 60,   step: 1 },
+    Lifetime: { value: 1.35, min: 0.05, max: 2.0, step: 0.05 },
+    Size:     { value: 0.18, min: 0.01, max: 0.3, step: 0.01 },
+    Color:    { value: '#7b7b7b' },
+  });
+
+  useEffect(() => {
+    sparks.sparksPerHit = sparkCtrl.Count;
+    sparks.speed        = sparkCtrl.Speed;
+    sparks.gravity      = sparkCtrl.Gravity;
+    sparks.lifetime     = sparkCtrl.Lifetime;
+    sparks.size         = sparkCtrl.Size;
+    sparks.color.set(sparkCtrl.Color);
+  }, [sparkCtrl.Count, sparkCtrl.Speed, sparkCtrl.Gravity, sparkCtrl.Lifetime, sparkCtrl.Size, sparkCtrl.Color]);
+
+  // ── Crosshair ──
+  const crosshair = useControls('Crosshair', {
+    Show:       { value: true },
+    Width:      { value: 80, min: 4, max: 80, step: 1 },
+    Height:     { value: 57, min: 4, max: 80, step: 1 },
+    Stroke:     { value: 0.5, min: 0.5, max: 5, step: 0.25 },
+    Color:      { value: '#ffffff' },
+    Opacity:    { value: 0.50, min: 0, max: 1, step: 0.05 },
+    'Tick Radius':  { value: 6, min: 0, max: 60, step: 1 },
+    'Tick Length':  { value: 6, min: 1, max: 30, step: 1 },
+    'Tick Offset':  { value: 11, min: -30, max: 30, step: 1 },
+    'Tick Stroke':  { value: 0.5, min: 0.5, max: 5, step: 0.25 },
+  });
+
+  const chShow   = crosshair.Show;
+  const chW      = crosshair.Width;
+  const chH      = crosshair.Height;
+  const chStroke = crosshair.Stroke;
+  const chColor  = crosshair.Color;
+  const chAlpha  = crosshair.Opacity;
+  const tickRad  = crosshair['Tick Radius'];
+  const tickLen  = crosshair['Tick Length'];
+  const tickOff  = crosshair['Tick Offset'];
+  const tickStk  = crosshair['Tick Stroke'];
+
+  return (
+    <>
+      <RayDebugOverlay logger={rayLogger} />
+      {celCtrl.Enabled && (
+        <div style={{
+          position: 'fixed',
+          top: 10,
+          right: 310,
+          width: 250,
+          zIndex: 1000,
+        }}>
+          <ColorRampEditor stops={rampStops} onChange={onRampChange} />
+        </div>
+      )}
+      {chShow && (() => {
+        // SVG centered on the rect's center.
+        // Box uses chW/chH. Ticks use tickRad for their distance from center.
+        // tickOff shifts tick start inward (+) or outward (-).
+        const hw = chW / 2;
+        const hh = chH / 2;
+        const maxExtent = Math.max(hw, hh, tickRad - tickOff + tickLen);
+        const pad = maxExtent + tickStk;
+        const svgW = pad * 2;
+        const svgH = pad * 2;
+        const cx = pad;
+        const cy = pad;
+        return (
+          <svg
+            style={{
+              position: 'fixed',
+              top: '50%',
+              left: '50%',
+              transform: 'translate(-50%, -50%)',
+              pointerEvents: 'none',
+              zIndex: 999,
+              opacity: chAlpha,
+            }}
+            width={svgW}
+            height={svgH}
+            viewBox={`0 0 ${svgW} ${svgH}`}
+          >
+            {/* Rectangle */}
+            <rect
+              x={cx - hw}
+              y={cy - hh}
+              width={chW}
+              height={chH}
+              fill="none"
+              stroke={chColor}
+              strokeWidth={chStroke}
+            />
+            {/* Top tick */}
+            <line
+              x1={cx} y1={cy - tickRad + tickOff}
+              x2={cx} y2={cy - tickRad + tickOff + tickLen}
+              stroke={chColor} strokeWidth={tickStk}
+            />
+            {/* Bottom tick */}
+            <line
+              x1={cx} y1={cy + tickRad - tickOff}
+              x2={cx} y2={cy + tickRad - tickOff - tickLen}
+              stroke={chColor} strokeWidth={tickStk}
+            />
+            {/* Left tick */}
+            <line
+              x1={cx - tickRad + tickOff} y1={cy}
+              x2={cx - tickRad + tickOff + tickLen} y2={cy}
+              stroke={chColor} strokeWidth={tickStk}
+            />
+            {/* Right tick */}
+            <line
+              x1={cx + tickRad - tickOff} y1={cy}
+              x2={cx + tickRad - tickOff - tickLen} y2={cy}
+              stroke={chColor} strokeWidth={tickStk}
+            />
+          </svg>
+        );
+      })()}
+    </>
+  );
 }
 
 const guiRoot = document.createElement('div');

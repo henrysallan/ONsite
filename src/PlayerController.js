@@ -176,11 +176,15 @@ export class PlayerController {
     this._jump = null;     // null when grounded, { velocity: Vector3, airTime: number } when airborne
     this._jumpVelocity = new THREE.Vector3();
     this._jumpRequested = false; // set true on Space press, consumed on next update
-    this.jumpStrength = 3.0;     // upward velocity for ground jump (Leva-tunable)
+    this.jumpStrength = 3.0;     // MAX upward velocity (Leva-tunable)
+    this.jumpMinStrength = 1.5;  // tap jump velocity (Leva-tunable)
+    this.jumpChargeRate = 25.0;  // velocity added per second while holding (Leva-tunable)
     this.jumpGravity  = 9.8;    // gravity acceleration during jump (Leva-tunable)
     this.jumpAirSteer = 4.0;    // how fast player can steer mid-air (units/sec)
     this.jumpLatchRadius = 2.0; // proximity check distance for mid-air surface latch
     this.jumpTerminalVel = 20.0; // max downward speed (Leva-tunable)
+    this._jumpCharging = false;  // true while Space is held during ascent
+    this._jumpCharged = 0;       // total velocity added via charging so far
     this._jumpTuckTargets = [];  // per-limb tuck positions (body-local)
     this._jumpTuckNoise = [];    // per-limb noise phase offsets
     for (let i = 0; i < 6; i++) {
@@ -197,25 +201,29 @@ export class PlayerController {
     this.pitch = 0;
     this.mouseSensitivity = 0.002;
 
+    // ── Mouse / trackpad orbit input ──
+    this._rawDeltaX = 0;
+    this._rawDeltaY = 0;
+
     // --- Keyboard state ---
     this._keys = {};
     this._onKeyDown = (e) => {
       this._keys[e.code] = true;
       if (e.code === 'Space') this._jumpRequested = true;
     };
-    this._onKeyUp = (e) => { this._keys[e.code] = false; };
+    this._onKeyUp = (e) => {
+      this._keys[e.code] = false;
+      if (e.code === 'Space') this._jumpCharging = false;
+    };
     window.addEventListener('keydown', this._onKeyDown);
     window.addEventListener('keyup', this._onKeyUp);
 
     // --- Pointer lock + mouse move ---
+    // Accumulate raw deltas; spike-clamping + deadzone applied per-frame in update().
     this._onMouseMove = (e) => {
       if (document.pointerLockElement !== renderer_domElement) return;
-      this.yaw -= e.movementX * this.mouseSensitivity;
-      this.pitch -= e.movementY * this.mouseSensitivity;
-      // Expand pitch range on steep surfaces (walls) so camera can look further down
-      const steepness = 1 - Math.abs(this._bodyUp.y); // 0 on flat ground, ~1 on vertical wall
-      const maxPitch = Math.PI / 3 + steepness * Math.PI / 4; // 60° normally, up to 105° on walls
-      this.pitch = Math.max(-maxPitch, Math.min(maxPitch, this.pitch));
+      this._rawDeltaX += e.movementX;
+      this._rawDeltaY += e.movementY;
     };
     document.addEventListener('mousemove', this._onMouseMove);
   }
@@ -223,6 +231,17 @@ export class PlayerController {
   update(dt) {
     // Snapshot position at frame start for velocity clamping at the end
     this._prevPosition.copy(this.mesh.position);
+
+    // ── Consume accumulated mouse/trackpad input ──
+    this.yaw   -= this._rawDeltaX * this.mouseSensitivity;
+    this.pitch -= this._rawDeltaY * this.mouseSensitivity;
+    this._rawDeltaX = 0;
+    this._rawDeltaY = 0;
+
+    // Clamp pitch
+    const steepness = 1 - Math.abs(this._bodyUp.y);
+    const maxPitch = Math.PI * 0.49 + steepness * Math.PI / 4; // ~88° on flat ground
+    this.pitch = Math.max(-maxPitch, Math.min(maxPitch, this.pitch));
 
     const k = this._keys;
 
@@ -319,6 +338,8 @@ export class PlayerController {
         this.walk._inTransition = false;
       }
       this._launchJump();
+      this._jumpCharging = true;
+      this._jumpCharged = 0;
     }
     this._jumpRequested = false; // consume even if we couldn't jump
 
@@ -385,6 +406,7 @@ export class PlayerController {
         _footTmp.copy(footLocal).applyMatrix4(_invSkelLocal);
         this.skeleton.updateLimb(i, _footTmp);
       }
+      this.skeleton.updateGunRest();
       return;
     }
 
@@ -437,18 +459,26 @@ export class PlayerController {
                   const wh = _pcHitsArray[wi];
                   _tmpV3b.copy(wh.face.normal).transformDirection(wh.object.matrixWorld).normalize();
                   if (Math.abs(_tmpV3b.y) < 0.5) {
-                    // If wall is climbable and not steppable, trigger climb
-                    // immediately instead of blocking — let the body reach
-                    // the wall so the climb system engages seamlessly.
-                    if (wh.object.userData.climbable &&
-                        !this._hasSteppableTop(wh.point, this.mesh.position.y)) {
+                    // Check if this wall face has a walkable top within step height.
+                    // If so, don't block — let the body approach so step-up logic engages.
+                    // This is critical for stairs: each step's vertical face is wall-like
+                    // but has a walkable top surface the creature should step onto.
+                    if (this._hasSteppableTop(wh.point, this.mesh.position.y)) {
+                      break; // steppable — don't block, don't climb
+                    }
+                    // Climbable wall (not steppable): record the hit so the
+                    // climb system engages, but still cap movement to prevent
+                    // clipping through the mesh.
+                    if (wh.object.userData.climbable) {
                       if (!wallClimbHit) {
                         wallClimbHit = { point: wh.point.clone(), normal: _tmpV3b.clone() };
                       }
-                      // Don't block — let body approach the climbable wall
-                      break;
                     }
-                    const maxAllowed = Math.max(0, wh.distance - WALL_MARGIN);
+                    // Cap movement at the wall face. Use a tighter margin for
+                    // climbable walls so the body gets close enough for the
+                    // climb system to engage (climbDetectDist = 1.5).
+                    const margin = wh.object.userData.climbable ? 0.05 : WALL_MARGIN;
+                    const maxAllowed = Math.max(0, wh.distance - margin);
                     if (moveDist > maxAllowed) {
                       const scale = maxAllowed / moveDist;
                       _candidatePos.copy(this.mesh.position).addScaledVector(movedDelta, scale);
@@ -480,16 +510,34 @@ export class PlayerController {
         let floorHit = null;
         let bestFloorDist = Infinity;
         const currentY = this.mesh.position.y;
+        // Two-pass selection: first look for the highest walkable surface
+        // that is above us but within maxStepHeight (i.e. a stair step top).
+        // If none found, fall back to the surface closest to current Y.
+        let stepUpHit = null;
+        let bestStepUpY = -Infinity;
         for (let i = 0; i < _pcHitsArray.length; i++) {
           const h = _pcHitsArray[i];
           _tmpV3.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
           if (_tmpV3.y > 0.5) {
+            const heightAbove = h.point.y - currentY;
+            // Candidate for step-up: above us but within stepping reach
+            if (heightAbove > 0.01 && heightAbove <= this.maxStepHeight) {
+              if (h.point.y > bestStepUpY) {
+                bestStepUpY = h.point.y;
+                stepUpHit = h;
+              }
+            }
+            // Also track closest-to-current as fallback
             const dy = Math.abs(h.point.y - currentY);
             if (dy < bestFloorDist) {
               bestFloorDist = dy;
               floorHit = h;
             }
           }
+        }
+        // Prefer the step-up hit when walking toward higher ground
+        if (stepUpHit) {
+          floorHit = stepUpHit;
         }
         if (rayDebug && rayDebug.enabled) {
           const _bfOrig = _candidatePos.clone().addScaledVector(up, 5);
@@ -591,6 +639,7 @@ export class PlayerController {
         _footTmp.copy(footLocal).applyMatrix4(_invSkelLocal);
         this.skeleton.updateLimb(i, _footTmp);
       }
+      this.skeleton.updateGunRest();
       return;
     }
 
@@ -807,6 +856,7 @@ export class PlayerController {
       _footTmp.copy(footLocal).applyMatrix4(_invSkelLocal);
       this.skeleton.updateLimb(i, _footTmp);
     }
+    this.skeleton.updateGunRest();
 
     // ── Velocity clamp: prevent body launches ──
     // Cap total displacement this frame to maxBodySpeed * dt.
@@ -849,8 +899,8 @@ export class PlayerController {
         vel.set(0, 0, 0);
       } else {
         // Wall — push away from wall + slight upward boost
-        vel.copy(wallNormal).multiplyScalar(this.jumpStrength * 0.7);
-        vel.y += this.jumpStrength * 0.5;
+        vel.copy(wallNormal).multiplyScalar(this.jumpMinStrength * 0.7);
+        vel.y += this.jumpMinStrength * 0.5;
       }
       // Exit climbing state
       this.walk.climbing = false;
@@ -858,8 +908,8 @@ export class PlayerController {
       this._bodyUp.set(0, 1, 0);
       this._targetUp.set(0, 1, 0);
     } else {
-      // Ground — straight up along body up (which is roughly world Y on flat ground)
-      vel.set(0, this.jumpStrength, 0);
+      // Ground — straight up with minimum (tap) strength
+      vel.set(0, this.jumpMinStrength, 0);
     }
 
     this._jump = { airTime: 0 };
@@ -887,6 +937,19 @@ export class PlayerController {
   _updateJump(dt, fwd, right) {
     const jump = this._jump;
     jump.airTime += dt;
+
+    // ── Jump charge: boost velocity while Space is held ──
+    if (this._jumpCharging) {
+      const maxCharge = this.jumpStrength - this.jumpMinStrength;
+      const remaining = maxCharge - this._jumpCharged;
+      if (remaining > 0) {
+        const boost = Math.min(this.jumpChargeRate * dt, remaining);
+        this._jumpVelocity.y += boost;
+        this._jumpCharged += boost;
+      } else {
+        this._jumpCharging = false; // cap reached
+      }
+    }
 
     // ── Gravity ──
     this._jumpVelocity.y -= this.jumpGravity * dt;
@@ -1034,6 +1097,7 @@ export class PlayerController {
       _footTmp.applyMatrix4(_invSkelLocal);
       this.skeleton.updateLimb(i, _footTmp);
     }
+    this.skeleton.updateGunRest();
   }
 
   /**
@@ -1206,6 +1270,7 @@ export class PlayerController {
       _footTmp.applyMatrix4(_invSkelLocal);
       this.skeleton.updateLimb(i, _footTmp);
     }
+    this.skeleton.updateGunRest();
 
     if (t >= 1) {
       // Landing complete — finalize state

@@ -81,6 +81,21 @@ export function exportSkeletonGLB(skeleton) {
     exportGroup.add(mesh);
   }
 
+  // Gun limb joints
+  if (skeleton.gunData) {
+    const gunElbowGeo = new THREE.SphereGeometry(0.06, 8, 6);
+    const gunElbowMesh = new THREE.Mesh(gunElbowGeo, new THREE.MeshStandardMaterial({ color: 0xfbbf24 }));
+    gunElbowMesh.name = 'joint_gun_elbow';
+    gunElbowMesh.position.copy(skeleton.bones['gun_upper'].to);
+    exportGroup.add(gunElbowMesh);
+
+    const gunTipGeo = new THREE.SphereGeometry(0.06, 8, 6);
+    const gunTipMesh = new THREE.Mesh(gunTipGeo, new THREE.MeshStandardMaterial({ color: 0xef4444 }));
+    gunTipMesh.name = 'joint_gun_tip';
+    gunTipMesh.position.copy(skeleton.bones['gun_lower'].to);
+    exportGroup.add(gunTipMesh);
+  }
+
   // Export as binary GLB
   const exporter = new GLTFExporter();
   exporter.parse(

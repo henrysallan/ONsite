@@ -342,7 +342,10 @@ export class ProceduralWalk {
   /** Compute rest (home) foot positions based on skeleton dimensions. */
   _initLimbs() {
     const skel = this.skeleton;
-    const nodeZs = [-skel.spineLengths[0], 0, skel.spineLengths[1]];
+    // Limb-attached nodes: 0 (rear), 2 (mid), 4 (front)
+    const S1 = skel.spineLengths[0], S2 = skel.spineLengths[1];
+    const S3 = skel.spineLengths[2], S4 = skel.spineLengths[3];
+    const nodeZs = [-(S1 + S2), 0, S3 + S4];
 
     const limbs = [];
     for (let i = 0; i < 3; i++) {
