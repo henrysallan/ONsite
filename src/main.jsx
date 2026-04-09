@@ -9,7 +9,7 @@ THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
 import React, { useEffect, useState, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
-import { useControls, button } from 'leva';
+import { Leva, useControls, button } from 'leva';
 
 import { PostProcessing } from './PostProcessing.js';
 import { CelMaterial } from './CelMaterial.js';
@@ -363,6 +363,20 @@ let _vignetteBlurBlend = 0;     // smooth 0→1 for edge blur
 let _vignetteBlurLerpSpeed = 4.0;
 let _vignetteBlurMaxIntensity = 1.0;
 
+// ── Aim mode (right-click) ──
+let _aiming = false;
+let _aimFOV = 47;               // FOV when aiming
+let _aimLerpSpeed = 10.0;       // lerp speed into/out of aim
+let _currentAimBlend = 0;       // 0 = hip, 1 = fully aimed
+let _aimCrosshairScale = 0.4;   // crosshair scale while aiming
+
+// ── Sprint camera effects ──
+let _sprintFOV = 115;            // target FOV when sprinting
+let _sprintWobbleTime = 0;
+let _sprintWobbleMagXY = 0.08;   // heavy translation shake
+let _sprintWobbleMagRot = 0.35;  // heavy rotation shake
+let _sprintWobbleSpeed = 13.0;   // frequency
+
 // Reusable temporaries for per-frame camera work (avoid GC pressure)
 const _tmpRight = new THREE.Vector3();
 const _tmpUp = new THREE.Vector3();
@@ -455,9 +469,23 @@ renderer.domElement.addEventListener('mouseup', (e) => {
   _firing = false;
   _stopGunSound();
 });
+
+// ── Aim (right-click hold) ──
+renderer.domElement.addEventListener('mousedown', (e) => {
+  if (e.button !== 2) return;
+  if (document.pointerLockElement !== renderer.domElement) return;
+  _aiming = true;
+});
+renderer.domElement.addEventListener('mouseup', (e) => {
+  if (e.button !== 2) return;
+  _aiming = false;
+});
+renderer.domElement.addEventListener('contextmenu', (e) => e.preventDefault());
+
 document.addEventListener('pointerlockchange', () => {
   if (document.pointerLockElement !== renderer.domElement) {
     _firing = false;
+    _aiming = false;
     _stopGunSound();
     _showPauseModal();
   } else {
@@ -577,7 +605,8 @@ function animate() {
 
   climbDebug.update(player.walk, player.mesh.position);
 
-  // FOV lerp: stationary ↔ walking ↔ jumping (must run before camCtrl.update + fireBullet)
+  // FOV lerp: stationary ↔ walking ↔ jumping ↔ sprinting (must run before camCtrl.update + fireBullet)
+  let baseFOV;
   {
     const isWalking = (player._jump == null && !player._landing &&
       player.walk.inputDir.lengthSq() > 0.001) ? 1 : 0;
@@ -589,6 +618,12 @@ function animate() {
     const jumpBlendSpeed = isAirborne ? 3.0 : 6.0;
     _currentJumpFovBlend += (isAirborne - _currentJumpFovBlend) * (1 - Math.exp(-jumpBlendSpeed * dt));
     if (!isAirborne && _currentJumpFovBlend < 0.001) _currentJumpFovBlend = 0;
+
+    // Sprint blend (read from player controller's smoothed value)
+    const sprintBlend = player._currentSprintBlend;
+    const walkFov = _fovWalking + (_sprintFOV - _fovWalking) * sprintBlend;
+    baseFOV = _fovStationary + (walkFov - _fovStationary) * _currentFovBlend;
+    baseFOV = baseFOV + (_fovJumping - baseFOV) * _currentJumpFovBlend;
   }
 
   // Shoot camera lerp: offset Z + FOV (must run before camCtrl.update + fireBullet)
@@ -596,9 +631,6 @@ function animate() {
     const isShooting = (_firing && !_gunOverheated) ? 1 : 0;
     _currentShootBlend += (isShooting - _currentShootBlend) * (1 - Math.exp(-_shootLerpSpeed * dt));
     if (!isShooting && _currentShootBlend < 0.001) _currentShootBlend = 0;
-
-    let baseFOV = _fovStationary + (_fovWalking - _fovStationary) * _currentFovBlend;
-    baseFOV = baseFOV + (_fovJumping - baseFOV) * _currentJumpFovBlend;
 
     if (_currentShootBlend > 0.001) {
       camCtrl.offsetZ = camCtrl._baseOffsetZ + (_shootOffsetZ - camCtrl._baseOffsetZ) * _currentShootBlend;
@@ -608,6 +640,19 @@ function animate() {
       camera.fov = baseFOV;
     }
     camera.updateProjectionMatrix();
+  }
+
+  // Aim mode: override FOV → 47 and ramp shake to 0
+  {
+    const wantAim = _aiming ? 1 : 0;
+    _currentAimBlend += (wantAim - _currentAimBlend) * (1 - Math.exp(-_aimLerpSpeed * dt));
+    if (!wantAim && _currentAimBlend < 0.001) _currentAimBlend = 0;
+    if (wantAim && _currentAimBlend > 0.999) _currentAimBlend = 1;
+
+    if (_currentAimBlend > 0.001) {
+      camera.fov = camera.fov + (_aimFOV - camera.fov) * _currentAimBlend;
+      camera.updateProjectionMatrix();
+    }
   }
 
   camCtrl.update();
@@ -656,7 +701,7 @@ function animate() {
       const rx = Math.sin(t * 1.1) * 0.5 + Math.sin(t * 2.9) * 0.5;
       const ry = Math.sin(t * 0.9) * 0.4 + Math.sin(t * 2.1) * 0.6;
       const rz = Math.sin(t * 1.3) * 0.6 + Math.sin(t * 2.5) * 0.4;
-      const a = _wobbleActive;
+      const a = _wobbleActive * (1 - _currentAimBlend);
       // Apply translation in camera-local space
       _tmpRight.setFromMatrixColumn(camera.matrixWorld, 0);
       _tmpUp.setFromMatrixColumn(camera.matrixWorld, 1);
@@ -686,7 +731,7 @@ function animate() {
       const rx = Math.sin(t * 1.2) * 0.4 + Math.sin(t * 2.5) * 0.6;
       const ry = Math.sin(t * 0.8) * 0.3 + Math.sin(t * 2.3) * 0.7;
       const rz = Math.sin(t * 1.5) * 0.5 + Math.sin(t * 2.6) * 0.5;
-      const a = _walkWobbleActive;
+      const a = _walkWobbleActive * (1 - _currentAimBlend);
       _tmpRight.setFromMatrixColumn(camera.matrixWorld, 0);
       _tmpUp.setFromMatrixColumn(camera.matrixWorld, 1);
       camera.position.addScaledVector(_tmpRight, ox * _walkWobbleMagXY * a);
@@ -713,7 +758,7 @@ function animate() {
       const rx = Math.sin(t * 1.5) * 0.5 + Math.sin(t * 3.7) * 0.5;
       const ry = Math.sin(t * 1.1) * 0.3 + Math.sin(t * 2.9) * 0.7;
       const rz = Math.sin(t * 1.8) * 0.6 + Math.sin(t * 3.2) * 0.4;
-      const a = _shootWobbleActive;
+      const a = _shootWobbleActive * (1 - _currentAimBlend);
       _tmpRight.setFromMatrixColumn(camera.matrixWorld, 0);
       _tmpUp.setFromMatrixColumn(camera.matrixWorld, 1);
       camera.position.addScaledVector(_tmpRight, ox * _shootWobbleMagXY * a);
@@ -724,6 +769,31 @@ function animate() {
       camera.rotation.z += rz * _shootWobbleMagRot * deg2 * a;
     } else {
       _shootWobbleTime = 0;
+    }
+  }
+
+  // Sprint camera wobble
+  {
+    const sprintBlend = player._currentSprintBlend;
+    if (sprintBlend > 0.001) {
+      _sprintWobbleTime += dt * _sprintWobbleSpeed;
+      const t = _sprintWobbleTime;
+      const ox = Math.sin(t * 0.9) * 0.5 + Math.sin(t * 2.0) * 0.3 + Math.cos(t * 1.3) * 0.2;
+      const oy = Math.sin(t * 1.5) * 0.6 + Math.sin(t * 2.6) * 0.4;
+      const rx = Math.sin(t * 1.1) * 0.5 + Math.sin(t * 2.7) * 0.5;
+      const ry = Math.sin(t * 0.7) * 0.4 + Math.sin(t * 2.2) * 0.6;
+      const rz = Math.sin(t * 1.4) * 0.5 + Math.sin(t * 2.4) * 0.5;
+      const a = sprintBlend * (1 - _currentAimBlend);
+      _tmpRight.setFromMatrixColumn(camera.matrixWorld, 0);
+      _tmpUp.setFromMatrixColumn(camera.matrixWorld, 1);
+      camera.position.addScaledVector(_tmpRight, ox * _sprintWobbleMagXY * a);
+      camera.position.addScaledVector(_tmpUp,    oy * _sprintWobbleMagXY * a);
+      const deg2 = Math.PI / 180;
+      camera.rotation.x += rx * _sprintWobbleMagRot * deg2 * a;
+      camera.rotation.y += ry * _sprintWobbleMagRot * deg2 * a;
+      camera.rotation.z += rz * _sprintWobbleMagRot * deg2 * a;
+    } else {
+      _sprintWobbleTime = 0;
     }
   }
 
@@ -864,6 +934,16 @@ function GunHeatBar() {
 }
 
 function LevaPanel() {
+  const [hidden, setHidden] = useState(true);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.code === 'KeyL' && !e.repeat) setHidden((h) => !h);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
   // ── Climb Debug Vis ──
   const debug = useControls('Debug', {
     'Climb Rays': { value: true },
@@ -1037,6 +1117,11 @@ function LevaPanel() {
     walk.stepHeight              = gait['Step Height'];
     walk.stepDuration            = gait['Step Duration'];
     walk.bodySpeed               = walk.strideLength / walk.stepDuration;
+    // Sync base snapshots so sprint multiplier scales from Leva values
+    walk._baseStrideLength       = gait['Stride Length'];
+    walk._baseStepHeight         = gait['Step Height'];
+    walk._baseStepDuration       = gait['Step Duration'];
+    walk._baseBodySpeed          = walk._baseStrideLength / walk._baseStepDuration;
     walk.phaseSpread             = gait['Phase Spread'];
     walk.phaseRandomness         = gait['Phase Randomness'];
     walk.idleCorrectionThreshold = gait['Idle Correction'];
@@ -1391,8 +1476,8 @@ function LevaPanel() {
   // ── Bloom ──
   const bloomCtrl = useControls('Bloom', {
     Intensity:   { value: 1.0,  min: 0,   max: 5,   step: 0.05 },
-    Threshold:   { value: 0.9,  min: 0,   max: 2,   step: 0.05 },
-    Smoothing:   { value: 0.3,  min: 0,   max: 1,   step: 0.05 },
+    Threshold:   { value: 0.4,  min: 0,   max: 2,   step: 0.05 },
+    Smoothing:   { value: 0.35,  min: 0,   max: 1,   step: 0.05 },
   });
 
   useEffect(() => {
@@ -1476,12 +1561,14 @@ function LevaPanel() {
   const [hudOffY, setHudOffY] = useState(0);
   const [elevation, setElevation] = useState(0);
   const [speed, setSpeed] = useState(0);
+  const [aimBlend, setAimBlend] = useState(0);
   const _prevPos = useRef(new THREE.Vector3());
   const hudRaf = useRef();
   useEffect(() => {
     function tick() {
       setHudOffX(_hudOffsetX);
       setHudOffY(_hudOffsetY);
+      setAimBlend(_currentAimBlend);
 
       // Elevation
       const pos = player.mesh.position;
@@ -1506,6 +1593,7 @@ function LevaPanel() {
 
   return (
     <>
+      <Leva hidden={hidden} />
       {/* Gun heat bar – bottom left */}
       <GunHeatBar />
       {/* Elevation / Speed readout – upper left */}
@@ -1621,11 +1709,12 @@ function LevaPanel() {
               position: 'fixed',
               top: '50%',
               left: '50%',
-              transform: 'translate(-50%, -50%)',
+              transform: `translate(-50%, -50%) scale(${1 - aimBlend * (1 - _aimCrosshairScale)})`,
               pointerEvents: 'none',
               zIndex: 999,
               opacity: chAlpha,
               mixBlendMode: 'difference',
+              transition: 'none',
             }}
             width={svgW}
             height={svgH}

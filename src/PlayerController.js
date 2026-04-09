@@ -144,7 +144,7 @@ export class PlayerController {
 
     // ── Position safety: prevent body launches ──
     this._prevPosition = new THREE.Vector3();            // position at start of frame
-    this._maxBodySpeed = 20;                             // max units/sec body can move
+    this._maxBodySpeed = 40;                             // max units/sec body can move (raised for sprint)
 
     // ── Momentum-carry for wall transitions ──
     this._climbWallFwd = new THREE.Vector3(0, 1, 0);   // current "forward" on the wall surface
@@ -196,6 +196,12 @@ export class PlayerController {
     this._landing = null; // null | { timer, duration, startPos, endPos, startUp, endUp, isClimb, startFeet[], endFeet[], normal }
     this._landingDuration = 0.12; // seconds for smooth landing
     this._jumpCooldown = 0; // seconds remaining before next jump allowed
+
+    // ── Sprint state ──
+    this.sprinting = false;              // true while shift held + moving
+    this.sprintMultiplier = 1.5;         // speed multiplier when sprinting
+    this._currentSprintBlend = 0;        // smooth 0→1 for camera/FOV effects
+    this._sprintBlendSpeed = 6.0;        // how fast sprint blend ramps
 
     // ── Landing squash (spine height animation) ──
     this._landSquash = null;          // null | { phase: 'squash'|'recover'|'blend', timer, startY }
@@ -344,6 +350,22 @@ export class PlayerController {
       _inputDir.addScaledVector(_rightDir, right);
       _inputDir.normalize();
     }
+
+    // ── Sprint: hold shift while moving (ground only, not climbing) ──
+    const wantSprint = (k['ShiftLeft'] || k['ShiftRight']) &&
+                       _inputDir.lengthSq() > 0.001 &&
+                       !this.walk.climbing;
+    this.sprinting = wantSprint;
+    // Smooth blend for camera effects
+    const sprintTarget = wantSprint ? 1 : 0;
+    this._currentSprintBlend += (sprintTarget - this._currentSprintBlend) *
+      (1 - Math.exp(-this._sprintBlendSpeed * dt));
+    if (this._currentSprintBlend < 0.001) this._currentSprintBlend = 0;
+    if (this._currentSprintBlend > 0.999) this._currentSprintBlend = 1;
+    // Drive walk's sprint multiplier (smoothed so gait transitions aren't jarring)
+    const targetMult = wantSprint ? this.sprintMultiplier : 1.0;
+    this.walk.sprintMultiplier += (targetMult - this.walk.sprintMultiplier) *
+      (1 - Math.exp(-8.0 * dt));
 
     // ═══════════════════════════════════════════════════════════════════
     //  JUMP SYSTEM — launch, airborne physics, surface latch

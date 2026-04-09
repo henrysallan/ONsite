@@ -220,6 +220,15 @@ export class ProceduralWalk {
     this.stepDuration = 0.10;
     this.bodySpeed    = this.strideLength / this.stepDuration;
 
+    // ── Sprint multiplier ──
+    // Set by PlayerController when shift is held. Scales gait dynamically.
+    // The "effective" values used each frame are computed from base + multiplier.
+    this.sprintMultiplier = 1.0;        // 1.0 = walk, >1 = sprint
+    this._baseStrideLength = 0.60;      // snapshot of Leva strideLength
+    this._baseStepHeight   = 0.30;      // snapshot of Leva stepHeight
+    this._baseStepDuration = 0.10;      // snapshot of Leva stepDuration
+    this._baseBodySpeed    = this._baseStrideLength / this._baseStepDuration;
+
     // ── Phase controls ──
     this.phaseSpread     = 0.66;
     this.phaseRandomness = 0.42;
@@ -441,6 +450,15 @@ export class ProceduralWalk {
     const moving = this.inputDir.lengthSq() > 0.001;
     this._movedDelta.set(0, 0, 0);
     this._groundMeshes = groundMeshes || [];
+
+    // ── Apply sprint multiplier to gait each frame ──
+    const sm = this.sprintMultiplier;
+    this.strideLength = this._baseStrideLength * sm;
+    this.stepHeight   = this._baseStepHeight * Math.min(sm, 1.0 + (sm - 1.0) * 0.5); // grows slower
+    // Step duration shrinks (faster leg cycle) but not linearly — use sqrt so
+    // legs cycle faster without becoming invisible at high multipliers.
+    this.stepDuration = this._baseStepDuration / Math.sqrt(sm);
+    this.bodySpeed    = this.strideLength / this.stepDuration;
 
     // Debug data for ClimbDebugVis — reset each frame
     if (!this._dbg) this._dbg = {};
@@ -782,6 +800,25 @@ export class ProceduralWalk {
 
         const elapsed = ls.timer - ls.delay;
         const t = Math.min(elapsed / this.stepDuration, 1);
+
+        // ── Mid-stride target re-projection ──
+        // At higher speeds (sprint) the body moves significantly during a step.
+        // Re-project the landing target toward where home *will* be when the
+        // step completes.  This keeps legs landing under the body, not behind it.
+        if (t < 0.85 && sm > 1.05) {
+          const limb = this.limbs[group[g]];
+          const remaining = (1 - t) * this.stepDuration;
+          // Predicted body displacement during remaining step time
+          const predict = this.bodySpeed * remaining;
+          this._rotateHome(limb.home, this._yaw).add(bodyGroup.position);
+          _tmpV.copy(_worldHome).addScaledVector(this._smoothedInput, this.strideLength * 0.5);
+          // Only move target forward (toward prediction), never backward
+          _tmpV2.subVectors(_tmpV, ls.targetPos);
+          if (_tmpV2.dot(this.inputDir) > 0) {
+            const blend = Math.min(1, sm * 0.3 * dt / this.stepDuration);
+            ls.targetPos.lerp(_tmpV, blend);
+          }
+        }
 
         const limb = this.limbs[group[g]];
         limb.current.lerpVectors(ls.startPos, ls.targetPos, t);
