@@ -236,7 +236,7 @@ const wallMat = celMats.environment;
   dracoLoader.setDecoderPath('/draco/');
   const loader = new GLTFLoader();
   loader.setDRACOLoader(dracoLoader);
-  loader.load('/testblock.glb', (gltf) => {
+  loader.load('public/meshes/testblock.glb', (gltf) => {
     const model = gltf.scene;
     model.position.set(0, 0, 5);
     model.traverse((child) => {

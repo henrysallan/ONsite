@@ -145,7 +145,7 @@ export class OutlinePass extends Pass {
     this.depthNormalRT.depthTexture = new THREE.DepthTexture();
     this.depthNormalRT.depthTexture.type = THREE.UnsignedIntType;
 
-    // Normal-rendering override material
+    // Normal-rendering override material (plain)
     this.normalMaterial = new THREE.MeshNormalMaterial();
 
     // The outline composite material
@@ -204,13 +204,13 @@ export class OutlinePass extends Pass {
     // 1) Render scene normals into our RT (depth comes for free via depthTexture)
     const bg = this._scene.background;
     const fog = this._scene.fog;
-    const overrideMat = this._scene.overrideMaterial;
 
     this._scene.background = null;
     this._scene.fog = null;
+
     this._scene.overrideMaterial = this.normalMaterial;
 
-    // Restrict pre-pass to layer 0 only (excludes muzzle flash on layer 1)
+    // Restrict pre-pass to layer 0 only (excludes muzzle flash / bullets on layer 1)
     const savedLayers = this._camera.layers.mask;
     this._camera.layers.set(0);
 
@@ -218,11 +218,10 @@ export class OutlinePass extends Pass {
     renderer.clear();
     renderer.render(this._scene, this._camera);
 
-    // Restore
+    this._scene.overrideMaterial = null;
     this._camera.layers.mask = savedLayers;
     this._scene.background = bg;
     this._scene.fog = fog;
-    this._scene.overrideMaterial = overrideMat;
 
     // 2) Composite lines over the scene colour
     this._outlineMaterial.uniforms.inputBuffer.value = inputBuffer.texture;
