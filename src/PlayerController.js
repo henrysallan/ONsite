@@ -91,6 +91,7 @@ export class PlayerController {
 
     // --- Skeleton-based player body ---
     this.skeleton = new PlayerSkeleton();
+    this.skeleton.setLiveHeight(0.1); // resting stance height
     group.add(this.skeleton.group);
 
     // --- Procedural walk system ---
@@ -195,6 +196,26 @@ export class PlayerController {
     this._landing = null; // null | { timer, duration, startPos, endPos, startUp, endUp, isClimb, startFeet[], endFeet[], normal }
     this._landingDuration = 0.12; // seconds for smooth landing
     this._jumpCooldown = 0; // seconds remaining before next jump allowed
+
+    // ── Landing squash (spine height animation) ──
+    this._landSquash = null;          // null | { phase: 'squash'|'recover'|'blend', timer, startY }
+    this._squashAirY      = 0.6;     // spine height while airborne
+    this._squashImpactY   = 0.05;    // lowest point of squash
+    this._squashRestY     = 0.1;     // normal resting height
+    this._squashDuration  = 0.5;     // seconds for impact squash  (fast)
+    this._squashRecoverDur = 0.80;   // seconds for recover phase  (slower)
+
+    // Post-landing foot blend (smooth tuck → walk transition)
+    this._footBlend = null;          // null | { timer, duration, startFeet: Vector3[6] }
+    this._footBlendDur = 0.2;        // seconds to blend from snapshot → walk
+    this._footBlendSnap = [];
+    for (let i = 0; i < 6; i++) this._footBlendSnap.push(new THREE.Vector3());
+
+    this._fallTime        = 0;       // seconds of continuous downward velocity
+    this._fallPrepDelay   = 0.01;    // start lerping spine after this many seconds of falling
+    this._fallPrepDur     = 0.6;     // seconds to lerp from current height to _squashAirY
+    this._fallPrepStartY  = 0;       // snapshot of spineHeight when fall-prep begins
+    this._fallPrepTimer   = 0;       // progress through the fall-prep lerp
 
     // Mouse-look state
     this.yaw = 0;
@@ -354,6 +375,9 @@ export class PlayerController {
       this._updateJump(dt, fwd, right);
       return; // skip normal walk/transition logic entirely
     }
+
+    // Tick landing squash (spine height only — walk system handles body height)
+    if (this._landSquash) this._updateLandSquash(dt);
 
     // Drive the walk system (pass yaw explicitly so walk doesn't depend on Euler decomposition)
     // During transition, suppress normal input — forced steps handle feet
@@ -717,12 +741,18 @@ export class PlayerController {
     const heightDiff = targetHeight - currentHeight;
     // Deadband: skip tiny adjustments to prevent correction-loop feedback on walls
     if (Math.abs(heightDiff) > 0.01) {
-      const posAlpha = Math.min(1, this.bodyPosSmooth * dt);
-      // Drop-rate limiter: clamp downward movement to prevent plummeting through surfaces
-      const maxDrop = 2.0 * dt; // max 2 units/sec downward
-      const rawDelta = heightDiff * posAlpha;
-      const clampedDelta = rawDelta < -maxDrop ? -maxDrop : rawDelta;
-      this.mesh.position.addScaledVector(this._bodyUp, clampedDelta);
+      if (this._landSquash) {
+        // During squash animation, snap body height directly so the
+        // squash/recover curve is visually accurate (no smooth lag).
+        this.mesh.position.addScaledVector(this._bodyUp, heightDiff);
+      } else {
+        const posAlpha = Math.min(1, this.bodyPosSmooth * dt);
+        // Drop-rate limiter: clamp downward movement to prevent plummeting through surfaces
+        const maxDrop = 2.0 * dt; // max 2 units/sec downward
+        const rawDelta = heightDiff * posAlpha;
+        const clampedDelta = rawDelta < -maxDrop ? -maxDrop : rawDelta;
+        this.mesh.position.addScaledVector(this._bodyUp, clampedDelta);
+      }
     }
 
     // ── Body centering on narrow surfaces ──
@@ -850,10 +880,32 @@ export class PlayerController {
     skelGroup.updateMatrixWorld(true);
     _invSkelLocal.copy(skelGroup.matrix).invert();
 
+    // Tick foot blend
+    if (this._footBlend) {
+      this._footBlend.timer += dt;
+      if (this._footBlend.timer >= this._footBlend.duration) {
+        this._footBlend = null;
+      }
+    }
+
     this.walk.cacheBodyInverse(this.mesh);
     for (let i = 0; i < 6; i++) {
       const footLocal = this.walk.getFootLocal(i);
       _footTmp.copy(footLocal).applyMatrix4(_invSkelLocal);
+
+      // Blend from snapshot → walk during post-landing transition
+      if (this._footBlend) {
+        const bt = this._footBlend.timer / this._footBlend.duration;
+        const be = bt * bt * (3 - 2 * bt); // smoothstep
+        // Get snapshot foot in skeleton-local space
+        _tmpV3.copy(this._footBlendSnap[i]);
+        // world → body-local → skeleton-local
+        _invBodyMat.copy(this.mesh.matrixWorld).invert();
+        _tmpV3.applyMatrix4(_invBodyMat).applyMatrix4(_invSkelLocal);
+        // Lerp: at be=0 fully snapshot, at be=1 fully walk
+        _footTmp.lerpVectors(_tmpV3, _footTmp, be);
+      }
+
       this.skeleton.updateLimb(i, _footTmp);
     }
     this.skeleton.updateGunRest();
@@ -913,6 +965,19 @@ export class PlayerController {
     }
 
     this._jump = { airTime: 0 };
+
+    // Cancel any active squash and set spine height to resting value
+    // so the jump starts from a known state. Fall-prep will lerp it
+    // toward the air-ready height during descent.
+    this._landSquash = null;
+    this._fallTime = 0;
+    this._fallPrepTimer = 0;
+    this.skeleton.setLiveHeight(this._squashRestY);
+
+    // Reset skeleton group to neutral so stale body-noise offset
+    // doesn't persist through the entire jump
+    this.skeleton.group.position.set(0, 0, 0);
+    this.skeleton.group.rotation.set(0, 0, 0);
 
     // Detach all feet from surfaces
     for (const limb of this.walk.limbs) {
@@ -982,6 +1047,32 @@ export class PlayerController {
       const scale = maxHSpeed / Math.sqrt(hSpeedSq);
       this._jumpVelocity.x *= scale;
       this._jumpVelocity.z *= scale;
+    }
+
+    // ── Spine height management while airborne ──
+    if (this._jumpVelocity.y < 0) {
+      // Falling — extend legs + raise spine toward landing-ready height
+      this._fallTime += dt;
+      if (this._fallTime >= this._fallPrepDelay) {
+        if (this._fallPrepTimer === 0) {
+          this._fallPrepStartY = this.skeleton.spineHeight;
+        }
+        this._fallPrepTimer += dt;
+        const ft = Math.min(1, this._fallPrepTimer / this._fallPrepDur);
+        const fe = 1 - (1 - ft) * (1 - ft); // ease-out
+        const y = this._fallPrepStartY + (this._squashAirY - this._fallPrepStartY) * fe;
+        this.skeleton.setLiveHeight(y);
+      }
+    } else {
+      // Rising or at apex — smoothly tuck spine toward a compact height
+      this._fallTime = 0;
+      this._fallPrepTimer = 0;
+      const tuckTarget = this._squashRestY * 0.8; // slightly below rest for tuck
+      const currH = this.skeleton.spineHeight;
+      if (Math.abs(currH - tuckTarget) > 0.001) {
+        const tuckAlpha = Math.min(1, 6 * dt);
+        this.skeleton.setLiveHeight(currH + (tuckTarget - currH) * tuckAlpha);
+      }
     }
 
     // ── Move body ──
@@ -1061,9 +1152,39 @@ export class PlayerController {
 
     if (latched) return;
 
-    // ── Tuck legs with random wiggle ──
+    // ── Tuck legs / fall-prep legs ──
     this._noiseElapsed += dt;
-    this._updateJumpLegs(dt);
+    if (this._fallPrepTimer > 0) {
+      // Fall-prep active: lerp legs from tuck toward extended home positions
+      const ft = Math.min(1, this._fallPrepTimer / this._fallPrepDur);
+      const fe = 1 - (1 - ft) * (1 - ft); // ease-out
+      this.mesh.updateMatrixWorld(true);
+      for (let i = 0; i < 6; i++) {
+        const limb = this.walk.limbs[i];
+        const tuckTarget = this._jumpTuckTargets[i];
+        // Compute extended home position (full spread, at body height)
+        const homeWorld = _tmpV3.copy(limb.home)
+          .multiplyScalar(this.walk._hipScale);
+        homeWorld.applyMatrix4(this.mesh.matrixWorld);
+        // Lerp from current tuck toward extended home
+        tuckTarget.lerp(homeWorld, fe);
+        limb.current.copy(tuckTarget);
+      }
+    } else {
+      this._updateJumpLegs(dt);
+    }
+
+    // ── Blend skeleton group toward neutral while airborne ──
+    // Prevents stale body-noise offset from persisting through the jump
+    {
+      const blendRate = Math.min(1, 8 * dt);
+      this.skeleton.group.position.lerp(_tmpV3.set(0, 0, 0), blendRate);
+      // Rotation: lerp each axis toward 0
+      const r = this.skeleton.group.rotation;
+      r.x += (0 - r.x) * blendRate;
+      r.y += (0 - r.y) * blendRate;
+      r.z += (0 - r.z) * blendRate;
+    }
 
     // ── Body orientation: smoothly return to upright while airborne ──
     this._bodyUp.lerp(_tmpV3.set(0, 1, 0), Math.min(1, 3 * dt)).normalize();
@@ -1142,9 +1263,10 @@ export class PlayerController {
     // Compute end position
     const endPos = new THREE.Vector3();
     if (isClimb) {
-      endPos.copy(point).addScaledVector(normal, this.skeleton.spineHeight * 0.5);
+      endPos.copy(point).addScaledVector(normal, this.skeleton._refSpineHeight * 0.5);
     } else {
-      endPos.set(this.mesh.position.x, point.y, this.mesh.position.z);
+      // Use resting spine height for the target (not the inflated air-ready height)
+      endPos.set(this.mesh.position.x, point.y + this._squashRestY, this.mesh.position.z);
     }
 
     // Compute end up
@@ -1252,6 +1374,26 @@ export class PlayerController {
     _rotMat.makeBasis(_bodyRight, this._bodyUp, _bodyForward);
     this.mesh.quaternion.setFromRotationMatrix(_rotMat);
 
+    // Smoothly lerp spine height from air-ready toward rest during landing
+    {
+      const airH = this.skeleton.spineHeight;
+      const landH = this._squashRestY;
+      if (Math.abs(airH - landH) > 0.001) {
+        const hAlpha = Math.min(1, 8 * dt);
+        this.skeleton.setLiveHeight(airH + (landH - airH) * hAlpha);
+      }
+    }
+
+    // Keep skeleton group blended toward neutral during landing
+    {
+      const blendRate = Math.min(1, 8 * dt);
+      this.skeleton.group.position.lerp(_tmpV3.set(0, 0, 0), blendRate);
+      const r = this.skeleton.group.rotation;
+      r.x += (0 - r.x) * blendRate;
+      r.y += (0 - r.y) * blendRate;
+      r.z += (0 - r.z) * blendRate;
+    }
+
     // Interpolate foot positions
     this.mesh.updateMatrixWorld(true);
     const skelGroup = this.skeleton.group;
@@ -1295,6 +1437,46 @@ export class PlayerController {
       // so the creature still feels responsive on flat terrain.
       this._jumpCooldown = L.isClimb ? 0.1 : 0;
       this._landing = null;
+
+      // Begin landing squash from resting height (landing interpolation
+      // smoothly brought spine back to rest during the blend)
+      this.skeleton.setLiveHeight(this._squashRestY);
+      this._landSquash = { phase: 'squash', timer: 0, startY: this._squashRestY };
+
+      // Snapshot current foot positions for smooth blend into walk cycle
+      for (let i = 0; i < 6; i++) {
+        this._footBlendSnap[i].copy(this.walk.limbs[i].current);
+      }
+      this._footBlend = { timer: 0, duration: this._footBlendDur };
+    }
+  }
+
+  /**
+   * Animate spine height after landing: squash down (fast-in slow-out)
+   * then recover to resting height.
+   */
+  _updateLandSquash(dt) {
+    const sq = this._landSquash;
+    sq.timer += dt;
+
+    if (sq.phase === 'squash') {
+      const t = Math.min(1, sq.timer / this._squashDuration);
+      const e = 1 - (1 - t) * (1 - t); // ease-out
+      const y = sq.startY + (this._squashImpactY - sq.startY) * e;
+      this.skeleton.setLiveHeight(y);
+      if (t >= 1) {
+        sq.phase = 'recover';
+        sq.timer = 0;
+      }
+    } else {
+      // Recover: ease-out back to resting height
+      const t = Math.min(1, sq.timer / this._squashRecoverDur);
+      const e = 1 - (1 - t) * (1 - t);
+      const y = this._squashImpactY + (this._squashRestY - this._squashImpactY) * e;
+      this.skeleton.setLiveHeight(y);
+      if (t >= 1) {
+        this._landSquash = null;
+      }
     }
   }
 

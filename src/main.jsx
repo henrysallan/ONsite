@@ -1,26 +1,28 @@
 import * as THREE from 'three';
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 
 // Patch Three.js so every BufferGeometry can build a BVH and every Mesh raycasts through it
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import { useControls, button } from 'leva';
 
 import { PostProcessing } from './PostProcessing.js';
-import { defaultRampStops } from './CelShadingPass.js';
-import { ColorRampEditor } from './ColorRampEditor.jsx';
+import { CelMaterial } from './CelMaterial.js';
 import { PlayerController, setRendererDomElement } from './PlayerController.js';
 import { CameraController } from './CameraController.js';
 import { ClimbDebugVis } from './ClimbDebugVis.js';
 import { RayDebugLogger, setRayDebugLogger } from './RayDebugLogger.js';
 import { RayDebugOverlay } from './DebugOverlay.jsx';
-import { exportSkeletonGLB, loadCustomGeoGLB } from './SkeletonIO.js';
+import { exportSkeletonGLB, loadCustomGeoGLB, loadCustomGeoFromURL } from './SkeletonIO.js';
 import { BulletSystem } from './BulletSystem.js';
 import { SparkSystem } from './SparkSystem.js';
+import { MuzzleFlash } from './MuzzleFlash.js';
+import { DecalSystem } from './DecalSystem.js';
 
 // ───────────────────────────────────────────────
 // Three.js setup (module-level singletons)
@@ -38,8 +40,8 @@ document.body.appendChild(renderer.domElement);
 setRendererDomElement(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0xffffff);
-scene.fog = new THREE.Fog(0xffffff, 40, 120);
+scene.background = new THREE.Color('#0019ff');
+scene.fog = new THREE.Fog('#0019ff', 40, 120);
 
 const camera = new THREE.PerspectiveCamera(
   60,
@@ -48,8 +50,18 @@ const camera = new THREE.PerspectiveCamera(
   500
 );
 
+// Allow camera to see layer 1 (muzzle flash cards)
+camera.layers.enable(1);
+
 // ── Post-processing pipeline ──
 const postFX = new PostProcessing(renderer, scene, camera);
+
+// ── Per-category Cel Materials ──
+const celMats = {
+  ground:      new CelMaterial({ shadow: '#000048', mid: '#0000ff', highlight: '#0000ff', threshold1: 0.07, threshold2: 0.60 }),
+  environment: new CelMaterial({ shadow: '#000045', mid: '#0000ff', highlight: '#3d99ff', threshold1: 0.00, threshold2: 0.29 }),
+  character:   new CelMaterial({ shadow: '#0000ff', mid: '#ffffff', highlight: '#ffffff', threshold1: 0.30, threshold2: 0.60 }),
+};
 
 // ── Lighting ──
 scene.add(new THREE.AmbientLight(0xffffff, 0.5));
@@ -67,7 +79,7 @@ scene.add(dirLight);
 // ── Ground plane ──
 const ground = new THREE.Mesh(
   new THREE.PlaneGeometry(200, 200),
-  new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 })
+  celMats.ground
 );
 ground.rotation.x = -Math.PI / 2;
 ground.receiveShadow = true;
@@ -80,7 +92,7 @@ grid.material.transparent = true;
 scene.add(grid);
 
 // ── Terrain: ramps and hills ──
-const terrainMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.85 });
+const terrainMat = celMats.environment;
 ground.geometry.computeBoundsTree();
 const groundMeshes = [ground]; // collect all walkable surfaces
 
@@ -139,8 +151,7 @@ const groundMeshes = [ground]; // collect all walkable surfaces
   }
   geo.computeVertexNormals();
   geo.computeBoundsTree();
-  const hillMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 });
-  const hill = new THREE.Mesh(geo, hillMat);
+  const hill = new THREE.Mesh(geo, celMats.environment);
   hill.rotation.x = -Math.PI / 2;
   hill.position.set(12, 0, -12);
   hill.castShadow = true;
@@ -151,7 +162,7 @@ const groundMeshes = [ground]; // collect all walkable surfaces
 
 // Stepped platform – two flat boxes
 {
-  const step1 = new THREE.Mesh(new THREE.BoxGeometry(4, 0.5, 4), terrainMat.clone());
+  const step1 = new THREE.Mesh(new THREE.BoxGeometry(4, 0.5, 4), terrainMat);
   step1.geometry.computeBoundsTree();
   step1.position.set(-6, 0.25, 8);
   step1.castShadow = true;
@@ -159,7 +170,7 @@ const groundMeshes = [ground]; // collect all walkable surfaces
   scene.add(step1);
   groundMeshes.push(step1);
 
-  const step2 = new THREE.Mesh(new THREE.BoxGeometry(3, 1.0, 3), terrainMat.clone());
+  const step2 = new THREE.Mesh(new THREE.BoxGeometry(3, 1.0, 3), terrainMat);
   step2.geometry.computeBoundsTree();
   step2.position.set(-6, 0.5, 8);
   step2.castShadow = true;
@@ -169,7 +180,7 @@ const groundMeshes = [ground]; // collect all walkable surfaces
 }
 
 // ── Climbable walls ──
-const wallMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.75 });
+const wallMat = celMats.environment;
 
 // Wall 1 – tall vertical wall facing +X
 {
@@ -186,7 +197,7 @@ const wallMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.7
 
 // Wall 2 – L-shaped wall section (two boxes)
 {
-  const w1 = new THREE.Mesh(new THREE.BoxGeometry(2, 6, 8), wallMat.clone());
+  const w1 = new THREE.Mesh(new THREE.BoxGeometry(2, 6, 8), wallMat);
   w1.geometry.computeBoundsTree();
   w1.position.set(-14, 3, 4);
   w1.castShadow = true;
@@ -195,7 +206,7 @@ const wallMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.7
   scene.add(w1);
   groundMeshes.push(w1);
 
-  const w2 = new THREE.Mesh(new THREE.BoxGeometry(6, 6, 2), wallMat.clone());
+  const w2 = new THREE.Mesh(new THREE.BoxGeometry(6, 6, 2), wallMat);
   w2.geometry.computeBoundsTree();
   w2.position.set(-11, 3, 8);
   w2.castShadow = true;
@@ -209,7 +220,7 @@ const wallMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.7
 {
   const geo = new THREE.BoxGeometry(2, 8, 6);
   geo.computeBoundsTree();
-  const wall = new THREE.Mesh(geo, wallMat.clone());
+  const wall = new THREE.Mesh(geo, wallMat);
   wall.position.set(8, 3, -8);
   wall.rotation.z = 0.5; // ~30° tilt
   wall.castShadow = true;
@@ -221,7 +232,10 @@ const wallMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.7
 
 // ── Test block (loaded from GLB) ──
 {
+  const dracoLoader = new DRACOLoader();
+  dracoLoader.setDecoderPath('/draco/');
   const loader = new GLTFLoader();
+  loader.setDRACOLoader(dracoLoader);
   loader.load('/testblock.glb', (gltf) => {
     const model = gltf.scene;
     model.position.set(0, 0, 5);
@@ -230,28 +244,8 @@ const wallMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.7
         child.castShadow = true;
         child.receiveShadow = true;
         child.userData.climbable = true;
-        // FrontSide is sufficient with BVH (three-mesh-bvh) for precise
-        // ray-triangle tests. DoubleSide caused raycasts to hit interior
-        // surfaces, letting the player walk inside manifold meshes.
-        if (child.material) {
-          const normMat = (m) => {
-            m.color.set(0xffffff);
-            m.side = THREE.FrontSide;
-            m.roughness = 0.9;
-            m.metalness = 0;
-            m.emissive?.set(0x000000);
-            if (m.emissiveMap) { m.emissiveMap = null; }
-            if (m.metalnessMap) { m.metalnessMap = null; }
-            if (m.roughnessMap) { m.roughnessMap = null; }
-            if (m.map) { m.map = null; }
-            m.needsUpdate = true;
-          };
-          if (Array.isArray(child.material)) {
-            child.material.forEach(normMat);
-          } else {
-            normMat(child.material);
-          }
-        }
+        // Use environment cel material
+        child.material = celMats.environment;
         // Build BVH for fast trimesh raycasting on complex geometry
         child.geometry.computeBoundsTree();
         groundMeshes.push(child);
@@ -268,6 +262,7 @@ const wallMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.7
 // ── Player + Camera controllers ──
 const player = new PlayerController(scene);
 player.setGroundMeshes(groundMeshes);
+player.skeleton.setMaterial(celMats.character);
 const camCtrl = new CameraController(camera, player);
 camCtrl.setGroundMeshes([ground]);
 const climbDebug = new ClimbDebugVis(scene);
@@ -278,6 +273,9 @@ setRayDebugLogger(rayLogger);
 const sparks = new SparkSystem(scene);
 const bullets = new BulletSystem(scene, groundMeshes);
 bullets.sparks = sparks;
+const decals = new DecalSystem(scene);
+bullets.decals = decals;
+const muzzleFlash = new MuzzleFlash(scene);
 const _aimRaycaster = new THREE.Raycaster();
 const _aimDir = new THREE.Vector3();
 const _gunTipW = new THREE.Vector3();
@@ -287,6 +285,92 @@ const _screenCenter = new THREE.Vector2(0, 0); // NDC center
 // ── Continuous fire state ──
 let _firing = false;
 let _fireCooldown = 0;
+
+// ── Gun heat system ──
+let _gunHeat = 1.0;          // 1 = full charge, 0 = empty
+
+// ── HUD parallax ──
+let _hudOffsetX = 0;
+let _hudOffsetY = 0;
+let _hudParallaxAmount = 12; // px per unit/s of camera velocity
+let _hudParallaxSmooth = 6;  // lerp speed (higher = snappier return)
+let _hudMaxPx = 8;           // max pixel displacement
+const _prevCamPos = new THREE.Vector3();
+let _hudParallaxInited = false;
+
+// ── Airborne camera wobble ──
+let _wobbleTime = 0;
+let _wobbleMagXY = 0.03;    // translation magnitude (world units)
+let _wobbleMagRot = 0.15;   // rotation magnitude (degrees)
+let _wobbleSpeed = 2.5;     // base frequency
+let _wobbleActive = 0;      // smooth blend 0→1
+
+// ── Walk camera wobble ──
+let _walkWobbleTime = 0;
+let _walkWobbleMagXY = 0.045;   // translation magnitude (world units)
+let _walkWobbleMagRot = 0.08;   // rotation magnitude (degrees)
+let _walkWobbleSpeed = 9.75;     // base frequency
+let _walkWobbleActive = 0;      // smooth blend 0→1
+
+// ── Shoot camera wobble ──
+let _shootWobbleTime = 0;
+let _shootWobbleMagXY = 0.02;   // translation magnitude (world units)
+let _shootWobbleMagRot = 0.27;  // rotation magnitude (degrees)
+let _shootWobbleSpeed = 14.5;    // base frequency (faster, jittery)
+let _shootWobbleActive = 0;     // smooth blend 0→1
+
+// ── Shoot camera lerp (offset Z + FOV) ──
+let _shootOffsetZ = -4.6;       // target offset Z while shooting
+let _shootFOV = 67;             // target FOV while shooting
+let _shootLerpSpeed = 6.0;      // lerp speed for shoot camera transition
+let _currentShootBlend = 0;     // 0 = idle, 1 = fully in shoot mode
+
+// ── FOV lerp (stationary / walking / jumping) ──
+let _fovStationary = 80;        // FOV when idle
+let _fovWalking = 94;           // FOV when walking
+let _fovJumping = 105;          // FOV when airborne
+let _fovLerpSpeed = 4.0;        // lerp speed for FOV transitions
+let _currentFovBlend = 0;       // 0 = stationary, 1 = walking
+let _currentJumpFovBlend = 0;   // 0 = grounded, 1 = airborne
+
+// ── Shoot vignette blur ──
+let _vignetteBlurBlend = 0;     // smooth 0→1 for edge blur
+let _vignetteBlurLerpSpeed = 4.0;
+let _vignetteBlurMaxIntensity = 1.0;
+
+// Reusable temporaries for per-frame camera work (avoid GC pressure)
+const _tmpRight = new THREE.Vector3();
+const _tmpUp = new THREE.Vector3();
+
+let _gunOverheated = false;
+let _gunDrainRate = 0.6;     // fraction of bar drained per second while firing
+let _gunRechargeTime = 2.0;  // seconds to recharge from 0 → 1
+let _gunRechargeDelay = 0.4; // seconds after releasing fire before recharge starts
+let _gunRechargeWait = 0;    // current wait timer
+
+// ── Background music ──
+const _bgMusic = new Audio('/sound/darkruins.mp3');
+_bgMusic.loop = true;
+_bgMusic.volume = 0.3;
+let _bgMusicStarted = false;
+
+// ── Gun sound ──
+const _gunAudio = new Audio('/sound/gun.mp3');
+_gunAudio.loop = true;
+_gunAudio.volume = 0.5;
+let _gunSoundPlaying = false;
+
+function _startGunSound() {
+  if (_gunSoundPlaying) return;
+  _gunAudio.currentTime = 0;
+  _gunAudio.play().catch(() => {}); // catch autoplay rejection
+  _gunSoundPlaying = true;
+}
+function _stopGunSound() {
+  if (!_gunSoundPlaying) return;
+  _gunAudio.pause();
+  _gunSoundPlaying = false;
+}
 
 function fireBullet() {
   // 1. Raycast from camera through screen center to find aim point
@@ -308,6 +392,7 @@ function fireBullet() {
 
   // 4. Fire!
   bullets.fire(_gunTipW, _aimDir);
+  muzzleFlash.fire();
 }
 
 renderer.domElement.addEventListener('mousedown', (e) => {
@@ -315,18 +400,30 @@ renderer.domElement.addEventListener('mousedown', (e) => {
   if (document.pointerLockElement !== renderer.domElement) return;
   _firing = true;
   _fireCooldown = 0; // fire immediately on first click
+  if (!_gunOverheated) _startGunSound();
 });
 renderer.domElement.addEventListener('mouseup', (e) => {
   if (e.button !== 0) return;
   _firing = false;
+  _stopGunSound();
 });
 document.addEventListener('pointerlockchange', () => {
-  if (document.pointerLockElement !== renderer.domElement) _firing = false;
+  if (document.pointerLockElement !== renderer.domElement) {
+    _firing = false;
+    _stopGunSound();
+    _showPauseModal();
+  } else {
+    _hidePauseModal();
+  }
 });
 
 // ── Pointer lock on canvas click ──
 renderer.domElement.addEventListener('click', () => {
   renderer.domElement.requestPointerLock();
+  if (!_bgMusicStarted) {
+    _bgMusic.play().catch(() => {});
+    _bgMusicStarted = true;
+  }
 });
 
 // ── Resize ──
@@ -336,6 +433,77 @@ window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
   postFX.setSize(window.innerWidth, window.innerHeight);
 });
+
+// ── Pause modal ──
+const _pauseOverlay = document.createElement('div');
+Object.assign(_pauseOverlay.style, {
+  position: 'fixed', inset: '0',
+  display: 'none', alignItems: 'center', justifyContent: 'center',
+  zIndex: '999', background: 'rgba(0,0,0,0.35)',
+  fontFamily: "'RestartSoft', sans-serif",
+});
+document.body.appendChild(_pauseOverlay);
+
+// wrapper to hold both circles in the same stacking spot
+const _pauseWrapper = document.createElement('div');
+Object.assign(_pauseWrapper.style, {
+  position: 'relative', width: '260px', height: '260px',
+});
+_pauseOverlay.appendChild(_pauseWrapper);
+
+// shadow circle (behind, offset down-left)
+const _pauseShadow = document.createElement('div');
+Object.assign(_pauseShadow.style, {
+  position: 'absolute', top: '8px', left: '-8px',
+  width: '260px', height: '260px', borderRadius: '50%',
+  background: '#fff', border: '1px solid #000',
+  pointerEvents: 'none',
+});
+_pauseWrapper.appendChild(_pauseShadow);
+
+const _pauseCircle = document.createElement('div');
+Object.assign(_pauseCircle.style, {
+  position: 'absolute', top: '0', left: '0',
+  width: '260px', height: '260px', borderRadius: '50%',
+  background: '#fff', border: '1px solid #000',
+  display: 'flex', flexDirection: 'column',
+  alignItems: 'center', justifyContent: 'center', gap: '18px',
+});
+_pauseWrapper.appendChild(_pauseCircle);
+
+const _pauseText = document.createElement('span');
+_pauseText.textContent = 'Game Paused';
+Object.assign(_pauseText.style, {
+  fontSize: '25px', color: '#000', letterSpacing: '1px',
+  textTransform: 'none', userSelect: 'none',
+});
+_pauseCircle.appendChild(_pauseText);
+
+const _unpauseBtn = document.createElement('button');
+_unpauseBtn.textContent = 'Unpause';
+Object.assign(_unpauseBtn.style, {
+  padding: '6px 20px', fontSize: '20px',
+  fontFamily: "'RestartSoft', sans-serif", background: '#fff',
+  border: '1px solid #000', borderRadius: '0',
+  cursor: 'pointer', letterSpacing: '1px',
+  textTransform: 'none',
+});
+_unpauseBtn.addEventListener('mouseenter', () => {
+  _unpauseBtn.style.background = '#000';
+  _unpauseBtn.style.color = '#fff';
+});
+_unpauseBtn.addEventListener('mouseleave', () => {
+  _unpauseBtn.style.background = '#fff';
+  _unpauseBtn.style.color = '#000';
+});
+_unpauseBtn.addEventListener('click', () => {
+  _pauseOverlay.style.display = 'none';
+  renderer.domElement.requestPointerLock();
+});
+_pauseCircle.appendChild(_unpauseBtn);
+
+function _showPauseModal()  { _pauseOverlay.style.display = 'flex'; }
+function _hidePauseModal()  { _pauseOverlay.style.display = 'none'; }
 
 // ── Game loop ──
 const clock = new THREE.Clock();
@@ -347,19 +515,209 @@ function animate() {
   rayLogger.beginFrame(dt);
   player.update(dt);
 
-  // Continuous fire
-  if (_firing) {
+  // Sync light direction to bullet shader
+  bullets._material.uniforms.uLightDir.value.copy(dirLight.position).normalize();
+
+  // Gun heat: recharge when not firing (after delay)
+  if (_firing && !_gunOverheated) {
+    _gunRechargeWait = _gunRechargeDelay;
     _fireCooldown -= dt;
     if (_fireCooldown <= 0) {
-      fireBullet();
+      _gunHeat -= (1 / bullets.fireRate) * _gunDrainRate;
+      if (_gunHeat <= 0) {
+        _gunHeat = 0;
+        _gunOverheated = true;
+        _stopGunSound();
+      } else {
+        fireBullet();
+      }
       _fireCooldown = 1 / bullets.fireRate;
+    }
+  } else {
+    _gunRechargeWait -= dt;
+    if (_gunRechargeWait <= 0) {
+      _gunHeat = Math.min(1, _gunHeat + dt / _gunRechargeTime);
+      if (_gunHeat >= 1) {
+        _gunHeat = 1;
+        _gunOverheated = false;
+      }
     }
   }
 
   bullets.update(dt);
   sparks.update(dt);
+
+  // Muzzle flash: update position to gun tip every frame
+  player.skeleton.group.updateMatrixWorld(true);
+  player.skeleton.getGunTipWorld(_gunTipW);
+  // Barrel direction: from gun elbow joint toward tip (in world space)
+  const _elbowW = player.skeleton.gunData.elbowJoint.position.clone();
+  player.skeleton.group.localToWorld(_elbowW);
+  _aimDir.subVectors(_gunTipW, _elbowW).normalize();
+  muzzleFlash.update(dt, _gunTipW, _aimDir);
+
   climbDebug.update(player.walk, player.mesh.position);
   camCtrl.update();
+
+  // Airborne camera wobble
+  {
+    const isAir = player._jump != null ? 1 : 0;
+    const blendSpeed = isAir ? 3.0 : 6.0; // fade in slower, fade out faster
+    _wobbleActive += (isAir - _wobbleActive) * (1 - Math.exp(-blendSpeed * dt));
+    if (_wobbleActive > 0.001) {
+      _wobbleTime += dt * _wobbleSpeed;
+      const t = _wobbleTime;
+      // Use incommensurate frequencies so it doesn't loop obviously
+      const ox = Math.sin(t * 1.0) * 0.6 + Math.sin(t * 2.3) * 0.4;
+      const oy = Math.sin(t * 1.4) * 0.5 + Math.sin(t * 2.7) * 0.5;
+      const rx = Math.sin(t * 1.1) * 0.5 + Math.sin(t * 2.9) * 0.5;
+      const ry = Math.sin(t * 0.9) * 0.4 + Math.sin(t * 2.1) * 0.6;
+      const rz = Math.sin(t * 1.3) * 0.6 + Math.sin(t * 2.5) * 0.4;
+      const a = _wobbleActive;
+      // Apply translation in camera-local space
+      _tmpRight.setFromMatrixColumn(camera.matrixWorld, 0);
+      _tmpUp.setFromMatrixColumn(camera.matrixWorld, 1);
+      camera.position.addScaledVector(_tmpRight, ox * _wobbleMagXY * a);
+      camera.position.addScaledVector(_tmpUp,    oy * _wobbleMagXY * a);
+      // Apply rotation
+      const deg = Math.PI / 180;
+      camera.rotation.x += rx * _wobbleMagRot * deg * a;
+      camera.rotation.y += ry * _wobbleMagRot * deg * a;
+      camera.rotation.z += rz * _wobbleMagRot * deg * a;
+    } else {
+      _wobbleTime = 0;
+    }
+  }
+
+  // Walk camera wobble
+  {
+    const isWalking = (player._jump == null && !player._landing &&
+      player.walk.inputDir.lengthSq() > 0.001) ? 1 : 0;
+    const blendSpeed = isWalking ? 4.0 : 8.0;
+    _walkWobbleActive += (isWalking - _walkWobbleActive) * (1 - Math.exp(-blendSpeed * dt));
+    if (_walkWobbleActive > 0.001) {
+      _walkWobbleTime += dt * _walkWobbleSpeed;
+      const t = _walkWobbleTime;
+      const ox = Math.sin(t * 1.0) * 0.5 + Math.sin(t * 2.1) * 0.3 + Math.cos(t * 0.7) * 0.2;
+      const oy = Math.sin(t * 1.6) * 0.6 + Math.sin(t * 2.8) * 0.4;
+      const rx = Math.sin(t * 1.2) * 0.4 + Math.sin(t * 2.5) * 0.6;
+      const ry = Math.sin(t * 0.8) * 0.3 + Math.sin(t * 2.3) * 0.7;
+      const rz = Math.sin(t * 1.5) * 0.5 + Math.sin(t * 2.6) * 0.5;
+      const a = _walkWobbleActive;
+      _tmpRight.setFromMatrixColumn(camera.matrixWorld, 0);
+      _tmpUp.setFromMatrixColumn(camera.matrixWorld, 1);
+      camera.position.addScaledVector(_tmpRight, ox * _walkWobbleMagXY * a);
+      camera.position.addScaledVector(_tmpUp,    oy * _walkWobbleMagXY * a);
+      const deg2 = Math.PI / 180;
+      camera.rotation.x += rx * _walkWobbleMagRot * deg2 * a;
+      camera.rotation.y += ry * _walkWobbleMagRot * deg2 * a;
+      camera.rotation.z += rz * _walkWobbleMagRot * deg2 * a;
+    } else {
+      _walkWobbleTime = 0;
+    }
+  }
+
+  // Shoot camera wobble
+  {
+    const isShooting = (_firing && !_gunOverheated) ? 1 : 0;
+    const blendSpeed = isShooting ? 6.0 : 10.0;
+    _shootWobbleActive += (isShooting - _shootWobbleActive) * (1 - Math.exp(-blendSpeed * dt));
+    if (_shootWobbleActive > 0.001) {
+      _shootWobbleTime += dt * _shootWobbleSpeed;
+      const t = _shootWobbleTime;
+      const ox = Math.sin(t * 1.3) * 0.4 + Math.sin(t * 3.1) * 0.4 + Math.cos(t * 2.0) * 0.2;
+      const oy = Math.sin(t * 1.7) * 0.5 + Math.sin(t * 3.4) * 0.5;
+      const rx = Math.sin(t * 1.5) * 0.5 + Math.sin(t * 3.7) * 0.5;
+      const ry = Math.sin(t * 1.1) * 0.3 + Math.sin(t * 2.9) * 0.7;
+      const rz = Math.sin(t * 1.8) * 0.6 + Math.sin(t * 3.2) * 0.4;
+      const a = _shootWobbleActive;
+      _tmpRight.setFromMatrixColumn(camera.matrixWorld, 0);
+      _tmpUp.setFromMatrixColumn(camera.matrixWorld, 1);
+      camera.position.addScaledVector(_tmpRight, ox * _shootWobbleMagXY * a);
+      camera.position.addScaledVector(_tmpUp,    oy * _shootWobbleMagXY * a);
+      const deg2 = Math.PI / 180;
+      camera.rotation.x += rx * _shootWobbleMagRot * deg2 * a;
+      camera.rotation.y += ry * _shootWobbleMagRot * deg2 * a;
+      camera.rotation.z += rz * _shootWobbleMagRot * deg2 * a;
+    } else {
+      _shootWobbleTime = 0;
+    }
+  }
+
+  // FOV lerp: stationary ↔ walking ↔ jumping
+  {
+    const isWalking = (player._jump == null && !player._landing &&
+      player.walk.inputDir.lengthSq() > 0.001) ? 1 : 0;
+    _currentFovBlend += (isWalking - _currentFovBlend) * (1 - Math.exp(-_fovLerpSpeed * dt));
+    if (!isWalking && _currentFovBlend < 0.001) _currentFovBlend = 0;
+    if (isWalking && _currentFovBlend > 0.999) _currentFovBlend = 1;
+
+    const isAirborne = player._jump != null ? 1 : 0;
+    const jumpBlendSpeed = isAirborne ? 3.0 : 6.0; // slower in, faster out
+    _currentJumpFovBlend += (isAirborne - _currentJumpFovBlend) * (1 - Math.exp(-jumpBlendSpeed * dt));
+    if (!isAirborne && _currentJumpFovBlend < 0.001) _currentJumpFovBlend = 0;
+  }
+
+  // Shoot camera lerp: offset Z + FOV
+  {
+    const isShooting = (_firing && !_gunOverheated) ? 1 : 0;
+    _currentShootBlend += (isShooting - _currentShootBlend) * (1 - Math.exp(-_shootLerpSpeed * dt));
+    // Snap to 0 when close enough to avoid permanently overriding base values
+    if (!isShooting && _currentShootBlend < 0.001) _currentShootBlend = 0;
+
+    // Dynamic base FOV: stationary → walking, then layer jump on top
+    let baseFOV = _fovStationary + (_fovWalking - _fovStationary) * _currentFovBlend;
+    baseFOV = baseFOV + (_fovJumping - baseFOV) * _currentJumpFovBlend;
+
+    if (_currentShootBlend > 0.001) {
+      // Lerp offset Z: interpolate between the Leva default and shoot target
+      camCtrl.offsetZ = camCtrl._baseOffsetZ + (_shootOffsetZ - camCtrl._baseOffsetZ) * _currentShootBlend;
+      // Lerp FOV: from dynamic base toward shoot FOV
+      camera.fov = baseFOV + (_shootFOV - baseFOV) * _currentShootBlend;
+      camera.updateProjectionMatrix();
+    } else {
+      // Restore base offset Z, apply walk-lerped FOV
+      camCtrl.offsetZ = camCtrl._baseOffsetZ;
+      camera.fov = baseFOV;
+      camera.updateProjectionMatrix();
+    }
+  }
+
+  // HUD parallax: offset based on camera world-space velocity
+  if (_hudParallaxInited && dt > 0) {
+    // Camera velocity in world space
+    const vx = (camera.position.x - _prevCamPos.x) / dt;
+    const vy = (camera.position.y - _prevCamPos.y) / dt;
+    const vz = (camera.position.z - _prevCamPos.z) / dt;
+    // Project velocity into screen space (right = +X, up = +Y)
+    _tmpRight.setFromMatrixColumn(camera.matrixWorld, 0);
+    _tmpUp.setFromMatrixColumn(camera.matrixWorld, 1);
+    const screenVx = vx * _tmpRight.x + vy * _tmpRight.y + vz * _tmpRight.z;
+    const screenVy = vx * _tmpUp.x    + vy * _tmpUp.y    + vz * _tmpUp.z;
+    // Target offset: opposite of velocity
+    const targetX = -screenVx * _hudParallaxAmount * 0.05;
+    const targetY = screenVy * _hudParallaxAmount * 0.05;
+    // Smooth toward target
+    const t = 1 - Math.exp(-_hudParallaxSmooth * dt);
+    _hudOffsetX += (targetX - _hudOffsetX) * t;
+    _hudOffsetY += (targetY - _hudOffsetY) * t;
+    // Clamp
+    _hudOffsetX = Math.max(-_hudMaxPx, Math.min(_hudMaxPx, _hudOffsetX));
+    _hudOffsetY = Math.max(-_hudMaxPx, Math.min(_hudMaxPx, _hudOffsetY));
+  }
+  _hudParallaxInited = true;
+  _prevCamPos.copy(camera.position);
+
+  // Vignette blur: lerp intensity (active when shooting, jumping, or walking)
+  {
+    const isWalking = (player._jump == null && !player._landing &&
+      player.walk.inputDir.lengthSq() > 0.001) ? 1 : 0;
+    const wantBlur = ((_firing && !_gunOverheated) || player._jump != null || isWalking) ? 1 : 0;
+    _vignetteBlurBlend += (wantBlur - _vignetteBlurBlend) * (1 - Math.exp(-_vignetteBlurLerpSpeed * dt));
+    if (!wantBlur && _vignetteBlurBlend < 0.001) _vignetteBlurBlend = 0;
+    postFX.vignetteBlurPass.intensity = _vignetteBlurBlend * _vignetteBlurMaxIntensity;
+  }
+
   postFX.render(dt);
 }
 
@@ -373,6 +731,91 @@ const walk = player.walk;
 
 // Bone label helpers
 const LIMB_LABELS = ['Rear L', 'Rear R', 'Mid L', 'Mid R', 'Front L', 'Front R'];
+
+function GunHeatBar() {
+  const [heat, setHeat] = useState(1);
+  const [overheated, setOverheated] = useState(false);
+  const rafRef = useRef();
+
+  const bar = useControls('Gun Bar', {
+    Width:    { value: 200, min: 40, max: 300, step: 1 },
+    Height:   { value: 10, min: 4, max: 40, step: 1 },
+    Bottom:   { value: 48, min: 10, max: 200, step: 1 },
+    Left:     { value: 48, min: 10, max: 200, step: 1 },
+    Stroke:   { value: 0.5, min: 0.25, max: 3, step: 0.25 },
+    Color:    { value: '#ffffff' },
+    Opacity:  { value: 1.0, min: 0, max: 1, step: 0.05 },
+    'Drain Rate':     { value: 0.6, min: 0.1, max: 3.0, step: 0.05 },
+    'Recharge Time':  { value: 2.0, min: 0.2, max: 5.0, step: 0.1 },
+    'Recharge Delay': { value: 0.4, min: 0.0, max: 2.0, step: 0.05 },
+  });
+
+  useEffect(() => {
+    _gunDrainRate = bar['Drain Rate'];
+    _gunRechargeTime = bar['Recharge Time'];
+    _gunRechargeDelay = bar['Recharge Delay'];
+  }, [bar['Drain Rate'], bar['Recharge Time'], bar['Recharge Delay']]);
+
+  useEffect(() => {
+    function tick() {
+      setHeat(_gunHeat);
+      setOverheated(_gunOverheated);
+      rafRef.current = requestAnimationFrame(tick);
+    }
+    rafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, []);
+
+  const fillW = Math.max(0, Math.min(1, heat));
+
+  const labelSize = 10;
+  const labelGap = 4;
+  const totalH = labelSize + labelGap + bar.Height;
+
+  return (
+    <svg
+      style={{
+        position: 'fixed',
+        bottom: bar.Bottom,
+        left: bar.Left,
+        pointerEvents: 'none',
+        zIndex: 999,
+        opacity: bar.Opacity,
+        overflow: 'visible',
+        mixBlendMode: 'difference',
+      }}
+      width={bar.Width}
+      height={totalH}
+    >
+      {/* Label */}
+      <text
+        x={0}
+        y={labelSize}
+        fill={overheated ? '#ff4444' : bar.Color}
+        fontFamily="RestartSoft, sans-serif"
+        fontSize={labelSize}
+        letterSpacing="0.08em"
+      >
+        GUN
+      </text>
+      {/* Outer frame */}
+      <rect
+        x={0} y={labelSize + labelGap}
+        width={bar.Width} height={bar.Height}
+        fill="none"
+        stroke={overheated ? '#ff4444' : bar.Color}
+        strokeWidth={bar.Stroke}
+      />
+      {/* Inner fill */}
+      <rect
+        x={0} y={labelSize + labelGap}
+        width={bar.Width * fillW} height={bar.Height}
+        fill={overheated ? '#ff4444' : bar.Color}
+        opacity={0.5}
+      />
+    </svg>
+  );
+}
 
 function LevaPanel() {
   // ── Climb Debug Vis ──
@@ -390,6 +833,15 @@ function LevaPanel() {
     if (!debug['Ray Logger']) rayLogger.hideAll();
   }, [debug['Ray Logger']]);
 
+  // ── Music ──
+  const music = useControls('Music', {
+    Volume: { value: 0.3, min: 0, max: 1, step: 0.01 },
+  });
+
+  useEffect(() => {
+    _bgMusic.volume = music.Volume;
+  }, [music.Volume]);
+
   // ── Camera ──
   const cameraOffset = useControls('Camera Offset', {
     X: { value: 0, min: -20, max: 20, step: 0.1 },
@@ -400,7 +852,10 @@ function LevaPanel() {
   const cameraSettings = useControls('Camera', {
     Pan:  { value: 0, min: -90, max: 90, step: 0.5 },
     Tilt: { value: 0, min: -45, max: 90, step: 0.5 },
-    FOV:  { value: 95, min: 20, max: 120, step: 1 },
+    'FOV Stationary': { value: 80, min: 20, max: 120, step: 1 },
+    'FOV Walking':    { value: 94, min: 20, max: 120, step: 1 },
+    'FOV Jumping':    { value: 105, min: 20, max: 140, step: 1 },
+    'FOV Lerp Speed': { value: 4.0, min: 0.5, max: 20, step: 0.5 },
     'Orbit Sensitivity': { value: 0.002, min: 0.0005, max: 0.01, step: 0.0005 },
   });
 
@@ -408,6 +863,7 @@ function LevaPanel() {
     camCtrl.offsetX = cameraOffset.X;
     camCtrl.offsetY = cameraOffset.Y;
     camCtrl.offsetZ = cameraOffset.Z;
+    camCtrl._baseOffsetZ = cameraOffset.Z;
   }, [cameraOffset.X, cameraOffset.Y, cameraOffset.Z]);
 
   useEffect(() => {
@@ -417,14 +873,18 @@ function LevaPanel() {
   }, [cameraSettings.Pan, cameraSettings.Tilt, cameraSettings['Orbit Sensitivity']]);
 
   useEffect(() => {
-    camera.fov = cameraSettings.FOV;
+    _fovStationary = cameraSettings['FOV Stationary'];
+    _fovWalking    = cameraSettings['FOV Walking'];
+    _fovJumping    = cameraSettings['FOV Jumping'];
+    _fovLerpSpeed  = cameraSettings['FOV Lerp Speed'];
+    camera.fov = _fovStationary;
     camera.updateProjectionMatrix();
-  }, [cameraSettings.FOV]);
+  }, [cameraSettings['FOV Stationary'], cameraSettings['FOV Walking'], cameraSettings['FOV Jumping'], cameraSettings['FOV Lerp Speed']]);
 
   const postPos = useControls('Camera Post-Offset (Position)', {
     X: { value: 2.6, min: -10, max: 10, step: 0.05 },
-    Y: { value: -0.9, min: -10, max: 10, step: 0.05 },
-    Z: { value: -0.1, min: -10, max: 10, step: 0.05 },
+    Y: { value: 0.0, min: -10, max: 10, step: 0.05 },
+    Z: { value: 0.0, min: -10, max: 10, step: 0.05 },
   });
 
   const postRot = useControls('Camera Post-Offset (Rotation)', {
@@ -444,6 +904,77 @@ function LevaPanel() {
     camCtrl.postRotY = postRot.Yaw;
     camCtrl.postRotZ = postRot.Roll;
   }, [postRot.Pitch, postRot.Yaw, postRot.Roll]);
+
+  // ── Airborne Wobble ──
+  const wobbleCtrl = useControls('Airborne Wobble', {
+    'Translate Mag': { value: 0.9, min: 0, max: 0.2, step: 0.005 },
+    'Rotate Mag':    { value: 0.9, min: 0, max: 2.0, step: 0.05 },
+    Speed:           { value: 5,  min: 0.5, max: 10, step: 0.25 },
+  });
+
+  useEffect(() => {
+    _wobbleMagXY  = wobbleCtrl['Translate Mag'];
+    _wobbleMagRot = wobbleCtrl['Rotate Mag'];
+    _wobbleSpeed  = wobbleCtrl.Speed;
+  }, [wobbleCtrl['Translate Mag'], wobbleCtrl['Rotate Mag'], wobbleCtrl.Speed]);
+
+  // ── Walk Wobble ──
+  const walkWobbleCtrl = useControls('Walk Wobble', {
+    'Translate Mag': { value: 0.015, min: 0, max: 0.2, step: 0.005 },
+    'Rotate Mag':    { value: 0.08,  min: 0, max: 2.0, step: 0.05 },
+    Speed:           { value: 4.0,   min: 0.5, max: 15, step: 0.25 },
+  });
+
+  useEffect(() => {
+    _walkWobbleMagXY  = walkWobbleCtrl['Translate Mag'];
+    _walkWobbleMagRot = walkWobbleCtrl['Rotate Mag'];
+    _walkWobbleSpeed  = walkWobbleCtrl.Speed;
+  }, [walkWobbleCtrl['Translate Mag'], walkWobbleCtrl['Rotate Mag'], walkWobbleCtrl.Speed]);
+
+  // ── Shoot Wobble ──
+  const shootWobbleCtrl = useControls('Shoot Wobble', {
+    'Translate Mag': { value: 0.02, min: 0, max: 0.2, step: 0.005 },
+    'Rotate Mag':    { value: 0.12, min: 0, max: 2.0, step: 0.05 },
+    Speed:           { value: 8.0,  min: 0.5, max: 20, step: 0.25 },
+  });
+
+  useEffect(() => {
+    _shootWobbleMagXY  = shootWobbleCtrl['Translate Mag'];
+    _shootWobbleMagRot = shootWobbleCtrl['Rotate Mag'];
+    _shootWobbleSpeed  = shootWobbleCtrl.Speed;
+  }, [shootWobbleCtrl['Translate Mag'], shootWobbleCtrl['Rotate Mag'], shootWobbleCtrl.Speed]);
+
+  // ── Shoot Camera ──
+  const shootCamCtrl = useControls('Shoot Camera', {
+    'Offset Z':   { value: -4.6, min: -15, max: 0, step: 0.1 },
+    FOV:          { value: 67,   min: 20, max: 120, step: 1 },
+    'Lerp Speed': { value: 6.0,  min: 1, max: 20, step: 0.5 },
+  });
+
+  useEffect(() => {
+    _shootOffsetZ    = shootCamCtrl['Offset Z'];
+    _shootFOV        = shootCamCtrl.FOV;
+    _shootLerpSpeed  = shootCamCtrl['Lerp Speed'];
+  }, [shootCamCtrl['Offset Z'], shootCamCtrl.FOV, shootCamCtrl['Lerp Speed']]);
+
+  // ── Shoot Blur ──
+  const shootBlurCtrl = useControls('Shoot Blur', {
+    Intensity:    { value: 1.0,  min: 0, max: 2.0, step: 0.05 },
+    'Lerp Speed': { value: 4.0,  min: 0.5, max: 20, step: 0.5 },
+    Radius:       { value: 0.2,  min: 0, max: 0.6, step: 0.01 },
+    Softness:     { value: 0.4,  min: 0.05, max: 1.0, step: 0.05 },
+    Strength:     { value: 0.04, min: 0.005, max: 0.15, step: 0.005 },
+    Samples:      { value: 12,   min: 4, max: 16, step: 1 },
+  });
+
+  useEffect(() => {
+    _vignetteBlurMaxIntensity = shootBlurCtrl.Intensity;
+    _vignetteBlurLerpSpeed   = shootBlurCtrl['Lerp Speed'];
+    postFX.vignetteBlurPass.radius   = shootBlurCtrl.Radius;
+    postFX.vignetteBlurPass.softness = shootBlurCtrl.Softness;
+    postFX.vignetteBlurPass.strength = shootBlurCtrl.Strength;
+    postFX.vignetteBlurPass.samples  = shootBlurCtrl.Samples;
+  }, [shootBlurCtrl.Intensity, shootBlurCtrl['Lerp Speed'], shootBlurCtrl.Radius, shootBlurCtrl.Softness, shootBlurCtrl.Strength, shootBlurCtrl.Samples]);
 
   // ── Gait ──
   const gait = useControls('Gait', {
@@ -548,6 +1079,18 @@ function LevaPanel() {
     skel.build();
   }, [body['Spine Height']]);
 
+  // ── Load default character mesh on mount ──
+  useEffect(() => {
+    loadCustomGeoFromURL('/meshes/player1.glb')
+      .then((meshMap) => {
+        skel.applyCustomGeo(meshMap);
+        console.log('[Skeleton] Default character mesh (player1.glb) loaded.');
+      })
+      .catch((err) => {
+        console.warn('[Skeleton] Could not load default player1.glb:', err);
+      });
+  }, []);
+
   // ── Skeleton GLB Export / Import ──
   useControls('Skeleton IO', {
     'Export GLB': button(() => {
@@ -563,12 +1106,15 @@ function LevaPanel() {
         try {
           const meshMap = await loadCustomGeoGLB(file);
           skel.applyCustomGeo(meshMap);
-          console.log('Custom geo loaded:', [...meshMap.keys()].join(', '));
         } catch (err) {
           console.error('Failed to load custom GLB:', err);
         }
       };
       input.click();
+    }),
+    'Clear Custom GLB': button(() => {
+      skel.clearCustomGeo();
+      console.log('[Skeleton] Custom geometry cleared, reverted to default cylinders.');
     }),
   });
 
@@ -635,7 +1181,7 @@ function LevaPanel() {
   // ── Sun ──
   const sunCtrl = useControls('Sun', {
     Height: { value: 60, min: 5, max: 90, step: 1 },
-    Angle:  { value: 45, min: 0, max: 360, step: 1 },
+    Angle:  { value: 220, min: 0, max: 360, step: 1 },
     Intensity: { value: 1.0, min: 0, max: 3, step: 0.05 },
   });
 
@@ -651,30 +1197,66 @@ function LevaPanel() {
     dirLight.intensity = sunCtrl.Intensity;
   }, [sunCtrl.Height, sunCtrl.Angle, sunCtrl.Intensity]);
 
-  // ── Cel Shading ──
-  const [rampStops, setRampStops] = useState(defaultRampStops());
-
-  const celCtrl = useControls('Cel Shading', {
-    Enabled:   { value: true },
-    Intensity: { value: 1.0, min: 0, max: 1, step: 0.05 },
-    Levels:    { value: 4, min: 0, max: 20, step: 1 },
-    'Add Level': button(() => {
-      // Increase the levels count by 1
-      const cur = postFX.celPass.levels;
-      postFX.celPass.levels = cur + 1;
-    }),
+  // ── Cel Shading: Ground ──
+  const celGround = useControls('Cel: Ground', {
+    Shadow:    { value: '#000048' },
+    Mid:       { value: '#000083' },
+    Highlight: { value: '#0000ff' },
+    'Threshold 1': { value: 0.07, min: 0, max: 1, step: 0.01 },
+    'Threshold 2': { value: 0.60, min: 0, max: 1, step: 0.01 },
   });
 
   useEffect(() => {
-    postFX.celPass.enabled = celCtrl.Enabled;
-    postFX.celPass.intensity = celCtrl.Intensity;
-    postFX.celPass.levels = celCtrl.Levels;
-  }, [celCtrl.Enabled, celCtrl.Intensity, celCtrl.Levels]);
+    celMats.ground.celShadow = celGround.Shadow;
+    celMats.ground.celMid = celGround.Mid;
+    celMats.ground.celHighlight = celGround.Highlight;
+    celMats.ground.threshold1 = celGround['Threshold 1'];
+    celMats.ground.threshold2 = celGround['Threshold 2'];
+  }, [celGround.Shadow, celGround.Mid, celGround.Highlight, celGround['Threshold 1'], celGround['Threshold 2']]);
 
-  const onRampChange = useCallback((newStops) => {
-    setRampStops(newStops);
-    postFX.celPass.setStops(newStops);
-  }, []);
+  // ── Cel Shading: Environment ──
+  const celEnv = useControls('Cel: Environment', {
+    Shadow:    { value: '#000045' },
+    Mid:       { value: '#0000ff' },
+    Highlight: { value: '#3d99ff' },
+    'Threshold 1': { value: 0.00, min: 0, max: 1, step: 0.01 },
+    'Threshold 2': { value: 0.29, min: 0, max: 1, step: 0.01 },
+  });
+
+  useEffect(() => {
+    celMats.environment.celShadow = celEnv.Shadow;
+    celMats.environment.celMid = celEnv.Mid;
+    celMats.environment.celHighlight = celEnv.Highlight;
+    celMats.environment.threshold1 = celEnv['Threshold 1'];
+    celMats.environment.threshold2 = celEnv['Threshold 2'];
+  }, [celEnv.Shadow, celEnv.Mid, celEnv.Highlight, celEnv['Threshold 1'], celEnv['Threshold 2']]);
+
+  // ── Cel Shading: Character ──
+  const celChar = useControls('Cel: Character', {
+    Shadow:    { value: '#0000ff' },
+    Mid:       { value: '#ffffff' },
+    Highlight: { value: '#ffffff' },
+    'Threshold 1': { value: 0.30, min: 0, max: 1, step: 0.01 },
+    'Threshold 2': { value: 0.60, min: 0, max: 1, step: 0.01 },
+  });
+
+  useEffect(() => {
+    celMats.character.celShadow = celChar.Shadow;
+    celMats.character.celMid = celChar.Mid;
+    celMats.character.celHighlight = celChar.Highlight;
+    celMats.character.threshold1 = celChar['Threshold 1'];
+    celMats.character.threshold2 = celChar['Threshold 2'];
+  }, [celChar.Shadow, celChar.Mid, celChar.Highlight, celChar['Threshold 1'], celChar['Threshold 2']]);
+
+  // ── Cel Shading: Sky ──
+  const celSky = useControls('Cel: Sky', {
+    Color: { value: '#0019ff' },
+  });
+
+  useEffect(() => {
+    scene.background = new THREE.Color(celSky.Color);
+    if (scene.fog) scene.fog.color.set(celSky.Color);
+  }, [celSky.Color]);
 
   // ── Line Art ──
   const lineCtrl = useControls('Line Art', {
@@ -720,13 +1302,17 @@ function LevaPanel() {
 
   // ── Bullets ──
   const bulletCtrl = useControls('Bullets', {
-    'Fire Rate':    { value: 18,   min: 1,     max: 30,  step: 1 },
+    'Fire Rate':    { value: 27,   min: 1,     max: 30,  step: 1 },
     'Spawn Offset': { value: 1.0,  min: 0,     max: 5.0, step: 0.1 },
-    Speed:          { value: 60,   min: 10,    max: 200, step: 5 },
+    Speed:          { value: 115,   min: 10,    max: 200, step: 5 },
     Lifetime:       { value: 0.60, min: 0.1,   max: 3.0, step: 0.05 },
-    Width:          { value: 0.04, min: 0.005, max: 0.3, step: 0.005 },
-    Length:         { value: 0.1,  min: 0.1,   max: 5.0, step: 0.1 },
-    Color:          { value: '#747474' },
+    Width:          { value: 0.2, min: 0.005, max: 0.3, step: 0.005 },
+    Length:         { value: 0.7,  min: 0.1,   max: 5.0, step: 0.1 },
+    Shadow:         { value: '#444444' },
+    Mid:            { value: '#888888' },
+    Highlight:      { value: '#e9ff00' },
+    Emissive:       { value: 50.0, min: 0, max: 50, step: 0.1 },
+    'Edge Softness': { value: 1.0, min: 0, max: 1, step: 0.05 },
   });
 
   useEffect(() => {
@@ -736,8 +1322,38 @@ function LevaPanel() {
     bullets.lifetime    = bulletCtrl.Lifetime;
     bullets.width       = bulletCtrl.Width;
     bullets.length      = bulletCtrl.Length;
-    bullets.color.set(bulletCtrl.Color);
-  }, [bulletCtrl['Fire Rate'], bulletCtrl['Spawn Offset'], bulletCtrl.Speed, bulletCtrl.Lifetime, bulletCtrl.Width, bulletCtrl.Length, bulletCtrl.Color]);
+    bullets.shadow.set(bulletCtrl.Shadow);
+    bullets.mid.set(bulletCtrl.Mid);
+    bullets.highlight.set(bulletCtrl.Highlight);
+    bullets.emissive    = bulletCtrl.Emissive;
+    bullets.edgeSoftness = bulletCtrl['Edge Softness'];
+  }, [bulletCtrl['Fire Rate'], bulletCtrl['Spawn Offset'], bulletCtrl.Speed, bulletCtrl.Lifetime, bulletCtrl.Width, bulletCtrl.Length, bulletCtrl.Shadow, bulletCtrl.Mid, bulletCtrl.Highlight, bulletCtrl.Emissive, bulletCtrl['Edge Softness']]);
+
+  // ── Muzzle Flash ──
+  const muzzleCtrl = useControls('Muzzle Flash', {
+    Size:     { value: 3.3,  min: 0.1, max: 5.0, step: 0.1 },
+    Duration: { value: 0.03, min: 0.01, max: 0.2, step: 0.005 },
+    Opacity:  { value: 1.0,  min: 0, max: 2.0, step: 0.05 },
+  });
+
+  useEffect(() => {
+    muzzleFlash.size     = muzzleCtrl.Size;
+    muzzleFlash.duration = muzzleCtrl.Duration;
+    muzzleFlash.opacity  = muzzleCtrl.Opacity;
+  }, [muzzleCtrl.Size, muzzleCtrl.Duration, muzzleCtrl.Opacity]);
+
+  // ── Bloom ──
+  const bloomCtrl = useControls('Bloom', {
+    Intensity:   { value: 1.0,  min: 0,   max: 5,   step: 0.05 },
+    Threshold:   { value: 0.9,  min: 0,   max: 2,   step: 0.05 },
+    Smoothing:   { value: 0.3,  min: 0,   max: 1,   step: 0.05 },
+  });
+
+  useEffect(() => {
+    postFX.bloomEffect.intensity           = bloomCtrl.Intensity;
+    postFX.bloomEffect.luminanceMaterial.threshold = bloomCtrl.Threshold;
+    postFX.bloomEffect.luminanceMaterial.smoothing = bloomCtrl.Smoothing;
+  }, [bloomCtrl.Intensity, bloomCtrl.Threshold, bloomCtrl.Smoothing]);
 
   // ── Sparks ──
   const sparkCtrl = useControls('Sparks', {
@@ -746,7 +1362,9 @@ function LevaPanel() {
     Gravity:  { value: 29,   min: 0,   max: 60,   step: 1 },
     Lifetime: { value: 1.35, min: 0.05, max: 2.0, step: 0.05 },
     Size:     { value: 0.18, min: 0.01, max: 0.3, step: 0.01 },
-    Color:    { value: '#7b7b7b' },
+    Shadow:   { value: '#444444' },
+    Mid:      { value: '#888888' },
+    Highlight:{ value: '#ffffff' },
   });
 
   useEffect(() => {
@@ -755,8 +1373,10 @@ function LevaPanel() {
     sparks.gravity      = sparkCtrl.Gravity;
     sparks.lifetime     = sparkCtrl.Lifetime;
     sparks.size         = sparkCtrl.Size;
-    sparks.color.set(sparkCtrl.Color);
-  }, [sparkCtrl.Count, sparkCtrl.Speed, sparkCtrl.Gravity, sparkCtrl.Lifetime, sparkCtrl.Size, sparkCtrl.Color]);
+    sparks.shadow.set(sparkCtrl.Shadow);
+    sparks.mid.set(sparkCtrl.Mid);
+    sparks.highlight.set(sparkCtrl.Highlight);
+  }, [sparkCtrl.Count, sparkCtrl.Speed, sparkCtrl.Gravity, sparkCtrl.Lifetime, sparkCtrl.Size, sparkCtrl.Shadow, sparkCtrl.Mid, sparkCtrl.Highlight]);
 
   // ── Crosshair ──
   const crosshair = useControls('Crosshair', {
@@ -765,7 +1385,7 @@ function LevaPanel() {
     Height:     { value: 57, min: 4, max: 80, step: 1 },
     Stroke:     { value: 0.5, min: 0.5, max: 5, step: 0.25 },
     Color:      { value: '#ffffff' },
-    Opacity:    { value: 0.50, min: 0, max: 1, step: 0.05 },
+    Opacity:    { value: 1.0, min: 0, max: 1, step: 0.05 },
     'Tick Radius':  { value: 6, min: 0, max: 60, step: 1 },
     'Tick Length':  { value: 6, min: 1, max: 30, step: 1 },
     'Tick Offset':  { value: 11, min: -30, max: 30, step: 1 },
@@ -783,20 +1403,160 @@ function LevaPanel() {
   const tickOff  = crosshair['Tick Offset'];
   const tickStk  = crosshair['Tick Stroke'];
 
+  // ── HUD Frame ──
+  const hud = useControls('HUD Frame', {
+    Show:       { value: true },
+    Margin:     { value: 24, min: 0, max: 100, step: 1 },
+    Padding:    { value: 12, min: 0, max: 100, step: 1 },
+    Stroke:     { value: 0.5, min: 0.25, max: 3, step: 0.25 },
+    Color:      { value: '#ffffff' },
+    Opacity:    { value: 1.0, min: 0, max: 1, step: 0.05 },
+    'Tick Length':  { value: 10, min: 2, max: 40, step: 1 },
+    'Tick Inset':   { value: 0, min: -20, max: 20, step: 1 },
+    'Tick Stroke':  { value: 0.5, min: 0.25, max: 3, step: 0.25 },
+    'Parallax':     { value: 12, min: 0, max: 40, step: 1 },
+    'Parallax Max':  { value: 8, min: 1, max: 30, step: 1 },
+    'Parallax Snap': { value: 6, min: 1, max: 20, step: 0.5 },
+  });
+
+  useEffect(() => {
+    _hudParallaxAmount = hud['Parallax'];
+    _hudMaxPx = hud['Parallax Max'];
+    _hudParallaxSmooth = hud['Parallax Snap'];
+  }, [hud['Parallax'], hud['Parallax Max'], hud['Parallax Snap']]);
+
+  // Poll parallax offset and telemetry for rendering
+  const [hudOffX, setHudOffX] = useState(0);
+  const [hudOffY, setHudOffY] = useState(0);
+  const [elevation, setElevation] = useState(0);
+  const [speed, setSpeed] = useState(0);
+  const _prevPos = useRef(new THREE.Vector3());
+  const hudRaf = useRef();
+  useEffect(() => {
+    function tick() {
+      setHudOffX(_hudOffsetX);
+      setHudOffY(_hudOffsetY);
+
+      // Elevation
+      const pos = player.mesh.position;
+      setElevation(pos.y);
+
+      // Speed (distance per second, smoothed over frame)
+      const dx = pos.x - _prevPos.current.x;
+      const dy = pos.y - _prevPos.current.y;
+      const dz = pos.z - _prevPos.current.z;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      // Approximate dt from 60fps; real dt isn't available here but
+      // requestAnimationFrame runs at display rate so this is close enough
+      setSpeed((s) => s + (dist * 60 - s) * 0.15);
+      _prevPos.current.copy(pos);
+
+      hudRaf.current = requestAnimationFrame(tick);
+    }
+    _prevPos.current.copy(player.mesh.position);
+    hudRaf.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(hudRaf.current);
+  }, []);
+
   return (
     <>
-      <RayDebugOverlay logger={rayLogger} />
-      {celCtrl.Enabled && (
-        <div style={{
+      {/* Gun heat bar – bottom left */}
+      <GunHeatBar />
+      {/* Elevation / Speed readout – upper left */}
+      <div
+        style={{
           position: 'fixed',
-          top: 10,
-          right: 310,
-          width: 250,
-          zIndex: 1000,
-        }}>
-          <ColorRampEditor stops={rampStops} onChange={onRampChange} />
+          top: 28,
+          left: 28,
+          pointerEvents: 'none',
+          zIndex: 999,
+          fontFamily: 'monospace',
+          fontSize: 11,
+          lineHeight: 1.5,
+          color: '#ffffff',
+          mixBlendMode: 'difference',
+          opacity: 0.8,
+          letterSpacing: '0.04em',
+          transform: `translate(${hudOffX}px, ${hudOffY}px)`,
+          willChange: 'transform',
+        }}
+      >
+        <div>ELV {elevation >= 0 ? '+' : '-'}{Math.abs(elevation).toFixed(5).padStart(10, '0')}</div>
+        <div>SPD {speed.toFixed(5).padStart(10, '0')}</div>
+      </div>
+      {/* HUD Frame overlay */}
+      {hud.Show && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: hud.Margin,
+            pointerEvents: 'none',
+            zIndex: 998,
+            opacity: hud.Opacity,
+            transform: `translate(${hudOffX}px, ${hudOffY}px)`,
+            willChange: 'transform',
+            mixBlendMode: 'difference',
+          }}
+        >
+          <svg
+            style={{ width: '100%', height: '100%', display: 'block' }}
+            preserveAspectRatio="none"
+          >
+            {/* Main rectangle */}
+            <rect
+              x={hud.Padding}
+              y={hud.Padding}
+              width={`calc(100% - ${hud.Padding * 2}px)`}
+              height={`calc(100% - ${hud.Padding * 2}px)`}
+              fill="none"
+              stroke={hud.Color}
+              strokeWidth={hud.Stroke}
+              vectorEffect="non-scaling-stroke"
+            />
+            {/* Top ticks – 2 evenly spaced */}
+            {[1/3, 2/3].map((f, i) => (
+              <line key={`t${i}`}
+                x1={`${f * 100}%`} y1={hud.Padding + hud['Tick Inset']}
+                x2={`${f * 100}%`} y2={hud.Padding + hud['Tick Inset'] + hud['Tick Length']}
+                stroke={hud.Color} strokeWidth={hud['Tick Stroke']}
+                vectorEffect="non-scaling-stroke"
+              />
+            ))}
+            {/* Bottom ticks – 2 evenly spaced */}
+            {[1/3, 2/3].map((f, i) => (
+              <line key={`b${i}`}
+                x1={`${f * 100}%`} y1={`calc(100% - ${hud.Padding + hud['Tick Inset']}px)`}
+                x2={`${f * 100}%`} y2={`calc(100% - ${hud.Padding + hud['Tick Inset'] + hud['Tick Length']}px)`}
+                stroke={hud.Color} strokeWidth={hud['Tick Stroke']}
+                vectorEffect="non-scaling-stroke"
+              />
+            ))}
+            {/* Left ticks – 2 evenly spaced */}
+            {[1/3, 2/3].map((f, i) => (
+              <line key={`l${i}`}
+                x1={hud.Padding + hud['Tick Inset']}
+                y1={`${f * 100}%`}
+                x2={hud.Padding + hud['Tick Inset'] + hud['Tick Length']}
+                y2={`${f * 100}%`}
+                stroke={hud.Color} strokeWidth={hud['Tick Stroke']}
+                vectorEffect="non-scaling-stroke"
+              />
+            ))}
+            {/* Right ticks – 2 evenly spaced */}
+            {[1/3, 2/3].map((f, i) => (
+              <line key={`r${i}`}
+                x1={`calc(100% - ${hud.Padding + hud['Tick Inset']}px)`}
+                y1={`${f * 100}%`}
+                x2={`calc(100% - ${hud.Padding + hud['Tick Inset'] + hud['Tick Length']}px)`}
+                y2={`${f * 100}%`}
+                stroke={hud.Color} strokeWidth={hud['Tick Stroke']}
+                vectorEffect="non-scaling-stroke"
+              />
+            ))}
+          </svg>
         </div>
       )}
+      <RayDebugOverlay logger={rayLogger} />
       {chShow && (() => {
         // SVG centered on the rect's center.
         // Box uses chW/chH. Ticks use tickRad for their distance from center.
@@ -819,6 +1579,7 @@ function LevaPanel() {
               pointerEvents: 'none',
               zIndex: 999,
               opacity: chAlpha,
+              mixBlendMode: 'difference',
             }}
             width={svgW}
             height={svgH}
@@ -867,5 +1628,6 @@ function LevaPanel() {
 
 const guiRoot = document.createElement('div');
 guiRoot.id = 'leva-root';
+Object.assign(guiRoot.style, { position: 'relative', zIndex: '10000' });
 document.body.appendChild(guiRoot);
 createRoot(guiRoot).render(<LevaPanel />);

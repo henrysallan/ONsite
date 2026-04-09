@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { mergeGeometries, toCreasedNormals } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 
 /**
  * Export the skeleton's current rest pose as a GLB file.
@@ -108,6 +110,20 @@ export function exportSkeletonGLB(skeleton) {
       a.download = 'skeleton_reference.glb';
       a.click();
       URL.revokeObjectURL(url);
+
+      const boneNames = Object.keys(skeleton.bones).join(', ');
+      console.log(
+        `%c=== Skeleton GLB exported ===%c\n` +
+        `Bones: ${boneNames}\n\n` +
+        `Blender workflow:\n` +
+        `  1. File → Import → glTF (.glb)\n` +
+        `  2. Replace/edit mesh geometry for any bone object\n` +
+        `     Keep the object NAME exactly as-is (or Blender may add .001)\n` +
+        `  3. Each bone's local space: origin at base, geometry along +Y (+Z in Blender)\n` +
+        `  4. File → Export → glTF (.glb)\n` +
+        `  5. Use "Import Custom GLB" button to load it back\n`,
+        'font-weight:bold;color:#4ade80', 'color:inherit'
+      );
     },
     (error) => { console.error('GLB export failed:', error); },
     { binary: true }
@@ -117,37 +133,118 @@ export function exportSkeletonGLB(skeleton) {
 /**
  * Load a GLB with custom geometry and return a map of { meshName → THREE.Mesh }.
  *
- * Convention: each mesh in the GLB must be named to match a bone segment
- * (e.g. hip_L0, leg_R2, spine1).  The mesh's local space should have:
- *   - Origin at the "from" joint (base of the bone)
- *   - Geometry extending along local +Y for the bone's length
+ * Handles Blender round-trip issues:
+ *   - Bakes the full GLTF world transform into geometry vertices so
+ *     Blender's Y↔Z axis conversion doesn't break orientation.
+ *   - Walks the ancestor chain for generic-named meshes (Mesh_5, etc.)
+ *     to find the real bone name from a parent Group node.
+ *   - Merges multi-primitive meshes (same parent) into a single geometry.
+ *   - Skips joint marker meshes (joint_*) from the export reference.
  *
- * At runtime, each custom mesh will be oriented from→to using the same
- * setFromUnitVectors(+Y, direction) as the default cylinders.
+ * The returned meshes have geometry in "skeleton space" (the same
+ * coordinate space as bone.from / bone.to).  PlayerSkeleton.applyCustomGeo
+ * will transform them into bone-local space.
  *
  * @returns {Promise<Map<string, THREE.Mesh>>}
  */
+/**
+ * Internal: parse a loaded GLTF scene into a bone-name → Mesh map.
+ * Shared by both the File-based and URL-based loaders.
+ */
+function _parseMeshMap(gltf) {
+  gltf.scene.updateMatrixWorld(true);
+
+  // ── Step 1: Collect all meshes grouped by their resolved bone name ──
+  const nameToGeos = new Map();
+
+  gltf.scene.traverse((child) => {
+    if (!child.isMesh) return;
+
+    // Walk up the ancestor chain to find a meaningful name.
+    let resolvedName = '';
+    let node = child;
+    while (node) {
+      const n = node.name || '';
+      if (n && !/^Mesh_\d+(_\d+)?$/.test(n)) {
+        resolvedName = n;
+        break;
+      }
+      node = node.parent;
+    }
+    if (!resolvedName) return;
+    if (resolvedName.startsWith('joint_')) return;
+    if (resolvedName === 'skeleton_reference') return;
+
+    const geo = child.geometry.clone();
+    geo.applyMatrix4(child.matrixWorld);
+
+    const mat = Array.isArray(child.material)
+      ? child.material[0].clone()
+      : child.material.clone();
+
+    if (!nameToGeos.has(resolvedName)) nameToGeos.set(resolvedName, []);
+    nameToGeos.get(resolvedName).push({ geometry: geo, material: mat });
+  });
+
+  // ── Step 2: Merge multi-primitive meshes & build final meshMap ──
+  const meshMap = new Map();
+  for (const [rawName, parts] of nameToGeos) {
+    let mergedGeo;
+    if (parts.length === 1) {
+      mergedGeo = parts[0].geometry;
+    } else {
+      mergedGeo = mergeGeometries(parts.map(p => p.geometry), false);
+      if (!mergedGeo) {
+        console.warn(`[SkeletonIO] Failed to merge geometries for "${rawName}", using first primitive`);
+        mergedGeo = parts[0].geometry;
+      }
+    }
+
+    const smoothGeo = toCreasedNormals(mergedGeo, Math.PI * 30 / 180);
+
+    const mesh = new THREE.Mesh(smoothGeo, parts[0].material);
+    mesh.name = rawName;
+    mesh.castShadow = true;
+    meshMap.set(rawName, mesh);
+  }
+
+  console.log('[SkeletonIO] Loaded meshes from GLB:', [...meshMap.keys()].join(', '));
+  return meshMap;
+}
+
 export function loadCustomGeoGLB(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
+      const dracoLoader = new DRACOLoader();
+      dracoLoader.setDecoderPath('/draco/');
       const loader = new GLTFLoader();
+      loader.setDRACOLoader(dracoLoader);
       loader.parse(e.target.result, '', (gltf) => {
-        const meshMap = new Map();
-        gltf.scene.traverse((child) => {
-          if (child.isMesh && child.name) {
-            // Clone the mesh so we own it
-            const cloned = child.clone();
-            cloned.geometry = child.geometry.clone();
-            cloned.material = child.material.clone();
-            cloned.castShadow = true;
-            meshMap.set(child.name, cloned);
-          }
-        });
-        resolve(meshMap);
+        resolve(_parseMeshMap(gltf));
       }, (error) => reject(error));
     };
     reader.onerror = reject;
     reader.readAsArrayBuffer(file);
+  });
+}
+
+/**
+ * Load a GLB from a URL (e.g. a path in /public) and return a mesh map.
+ * @param {string} url
+ * @returns {Promise<Map<string, THREE.Mesh>>}
+ */
+export function loadCustomGeoFromURL(url) {
+  return new Promise((resolve, reject) => {
+    const dracoLoader = new DRACOLoader();
+    dracoLoader.setDecoderPath('/draco/');
+    const loader = new GLTFLoader();
+    loader.setDRACOLoader(dracoLoader);
+    loader.load(
+      url,
+      (gltf) => resolve(_parseMeshMap(gltf)),
+      undefined,
+      (error) => reject(error)
+    );
   });
 }

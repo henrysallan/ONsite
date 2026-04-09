@@ -466,10 +466,10 @@ export class ProceduralWalk {
         if (onVerticalWall && this._climbTime > 0.3) {
           _rayOrigin.copy(bodyPos);
           // Cast downward for ground
-          let groundHit = castSurface(_rayOrigin, _tmpV.set(0, -1, 0), this._groundMeshes, this.skeleton.spineHeight + 3.0, 'climb_dismount');
+          let groundHit = castSurface(_rayOrigin, _tmpV.set(0, -1, 0), this._groundMeshes, this.skeleton._refSpineHeight + 3.0, 'climb_dismount');
           // Also cast UPWARD — if body clipped below floor, downward ray misses it
           if (!groundHit) {
-            groundHit = castSurface(_rayOrigin, _tmpV.set(0, 1, 0), this._groundMeshes, this.skeleton.spineHeight + 3.0, 'climb_dismount_up');
+            groundHit = castSurface(_rayOrigin, _tmpV.set(0, 1, 0), this._groundMeshes, this.skeleton._refSpineHeight + 3.0, 'climb_dismount_up');
           }
           if (groundHit && groundHit.normal.y > 0.7) {
             const distToGround = bodyPos.y - groundHit.point.y;
@@ -486,8 +486,8 @@ export class ProceduralWalk {
               const movingDown = this.inputDir.y < -0.05 ||
                 (this.inputDir.lengthSq() > 0.001 && this.inputDir.dot(_tmpV.set(0, -1, 0)) > 0.02);
               // B) Automatic: very close to ground (within half spineHeight)
-              const veryClose = distToGround < this.skeleton.spineHeight * 0.8;
-              if (distToGround < this.skeleton.spineHeight + 1.5 && (movingDown || veryClose)) {
+              const veryClose = distToGround < this.skeleton._refSpineHeight * 0.8;
+              if (distToGround < this.skeleton._refSpineHeight + 1.5 && (movingDown || veryClose)) {
                 this._transitionRequest = {
                   type: 'wall_to_ground',
                   point: groundHit.point.clone(),
@@ -700,7 +700,7 @@ export class ProceduralWalk {
             // If we lost the wall, check if there's ground to land on.
             if (!wrapped) {
               _rayOrigin.copy(bodyPos);
-              const gBelow = castSurface(_rayOrigin, _tmpV.set(0, -1, 0), this._groundMeshes, this.skeleton.spineHeight + 3, 'climb_wrap_ground');
+              const gBelow = castSurface(_rayOrigin, _tmpV.set(0, -1, 0), this._groundMeshes, this.skeleton._refSpineHeight + 3, 'climb_wrap_ground');
               if (gBelow && gBelow.normal.y > 0.7) {
                 this._transitionRequest = {
                   type: 'wall_to_ground',
@@ -751,7 +751,7 @@ export class ProceduralWalk {
           // Distance from body to wall surface along the wall normal direction
           _tmpV.subVectors(climbHit.point, bodyPos);
           const distToWall = Math.abs(_tmpV.dot(climbHit.normal));
-          const closeEnough = distToWall < this.skeleton.spineHeight * 2.5;
+          const closeEnough = distToWall < this.skeleton._refSpineHeight * 2.5;
           if (normalIsWall && closeEnough) {
             this.climbing = true;
             this._climbTime = 0;

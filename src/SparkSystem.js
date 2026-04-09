@@ -48,7 +48,9 @@ const sparkVert = /* glsl */`
 `;
 
 const sparkFrag = /* glsl */`
-  uniform vec3 uColor;
+  uniform vec3 uShadow;
+  uniform vec3 uMid;
+  uniform vec3 uHighlight;
   varying float vAge;
 
   void main() {
@@ -56,8 +58,13 @@ const sparkFrag = /* glsl */`
     float alpha = 1.0 - smoothstep(0.3, 1.0, vAge);
     if (alpha < 0.01) discard;
 
-    // Bright core
-    gl_FragColor = vec4(uColor * (1.0 + (1.0 - vAge) * 0.5), alpha);
+    // Young sparks are bright (highlight), old sparks are dim (shadow)
+    vec3 col;
+    if (vAge < 0.3) col = uHighlight;
+    else if (vAge < 0.6) col = uMid;
+    else col = uShadow;
+
+    gl_FragColor = vec4(col * (1.0 + (1.0 - vAge) * 0.5), alpha);
   }
 `;
 
@@ -79,7 +86,9 @@ export class SparkSystem {
     this.gravity      = 20;     // downward acceleration
     this.lifetime     = 0.4;    // seconds
     this.size         = 0.06;   // world-space quad size
-    this.color        = new THREE.Color(1, 1, 1);
+    this.shadow       = new THREE.Color('#444444');
+    this.mid          = new THREE.Color('#888888');
+    this.highlight    = new THREE.Color('#ffffff');
 
     // Spark pool
     this._sparks = [];
@@ -104,7 +113,9 @@ export class SparkSystem {
       vertexShader: sparkVert,
       fragmentShader: sparkFrag,
       uniforms: {
-        uColor: { value: this.color },
+        uShadow:    { value: this.shadow },
+        uMid:       { value: this.mid },
+        uHighlight: { value: this.highlight },
       },
       transparent: true,
       depthWrite: false,
@@ -205,7 +216,9 @@ export class SparkSystem {
     }
 
     // Sync uniforms
-    this._material.uniforms.uColor.value.copy(this.color);
+    this._material.uniforms.uShadow.value.copy(this.shadow);
+    this._material.uniforms.uMid.value.copy(this.mid);
+    this._material.uniforms.uHighlight.value.copy(this.highlight);
   }
 
   dispose() {

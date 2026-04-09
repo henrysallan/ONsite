@@ -41,16 +41,60 @@ _quadGeo.setAttribute('uv', new THREE.BufferAttribute(_quadUVs, 2));
 
 // ── Shader ──
 const bulletVert = /* glsl */`
+  varying vec3 vWorldPos;
+  varying vec3 vWorldNormal;
+  varying vec2 vUv;
+  varying vec3 vLocalPos;
   void main() {
     vec4 world = instanceMatrix * vec4(position, 1.0);
+    vWorldPos = world.xyz;
+    vUv = uv;
+    vLocalPos = position; // raw quad vertex in local space
+    // Approximate normal from instance orientation (bullets are thin quads)
+    vWorldNormal = normalize((instanceMatrix * vec4(0.0, 1.0, 0.0, 0.0)).xyz);
     gl_Position = projectionMatrix * viewMatrix * world;
   }
 `;
 
 const bulletFrag = /* glsl */`
-  uniform vec3 uColor;
+  uniform vec3 uShadow;
+  uniform vec3 uMid;
+  uniform vec3 uHighlight;
+  uniform float uThreshold1;
+  uniform float uThreshold2;
+  uniform vec3 uLightDir;
+  uniform float uEmissive;
+  uniform float uEdgeSoftness;
+
+  varying vec3 vWorldNormal;
+  varying vec2 vUv;
+  varying vec3 vLocalPos;
+
   void main() {
-    gl_FragColor = vec4(uColor, 1.0);
+    float NdotL = dot(normalize(vWorldNormal), normalize(uLightDir));
+    float lighting = NdotL * 0.5 + 0.5;
+
+    vec3 col;
+    if (lighting < uThreshold1) col = uShadow;
+    else if (lighting < uThreshold2) col = uMid;
+    else col = uHighlight;
+
+    // Radial distance from the center axis of the streak.
+    // Quad A spans X (y=0), Quad B spans Y (x=0).
+    // Both have their cross-section in the XY plane; Z is along the streak.
+    float radial = length(vLocalPos.xy) * 2.0; // 0 at center, 1 at edge
+
+    // Soft radial fade from center to edge
+    float edgeFade = 1.0 - smoothstep(1.0 - uEdgeSoftness, 1.0, radial);
+
+    // Soft tip fade along the length (Z: 0 = tail, 1 = head)
+    float along = vLocalPos.z; // 0→1
+    float tipFade = smoothstep(0.0, 0.15, along) * (1.0 - smoothstep(0.85, 1.0, along));
+
+    float alpha = edgeFade * tipFade;
+
+    // Output HDR with soft alpha
+    gl_FragColor = vec4(col * uEmissive, alpha);
   }
 `;
 
@@ -78,9 +122,12 @@ export class BulletSystem {
     this.lifetime   = 0.6;   // seconds
     this.width      = 0.04;  // world units
     this.length     = 1.2;   // world units
-    this.color      = new THREE.Color(1, 1, 1);
+    this.shadow     = new THREE.Color('#444444');
+    this.mid        = new THREE.Color('#888888');
+    this.highlight  = new THREE.Color('#ffffff');
     this.fireRate   = 12;    // shots per second
     this.spawnOffset = 1.0;  // distance to push spawn point forward along aim dir
+    this.emissive    = 3.0;  // emissive intensity multiplier (>1 triggers bloom)
 
     // ── Collision raycaster ──
     this._collisionRay = new THREE.Raycaster();
@@ -100,12 +147,22 @@ export class BulletSystem {
     this._aliveCount = 0;
 
     // ── Material ──
+    this.edgeSoftness = 0.6; // 0 = hard edge, 1 = fully soft
+
     this._material = new THREE.ShaderMaterial({
       vertexShader: bulletVert,
       fragmentShader: bulletFrag,
       uniforms: {
-        uColor: { value: this.color },
+        uShadow:       { value: this.shadow },
+        uMid:          { value: this.mid },
+        uHighlight:    { value: this.highlight },
+        uThreshold1:   { value: 0.3 },
+        uThreshold2:   { value: 0.6 },
+        uLightDir:     { value: new THREE.Vector3(0.5, 1.0, 0.5).normalize() },
+        uEmissive:     { value: this.emissive },
+        uEdgeSoftness: { value: this.edgeSoftness },
       },
+      transparent: true,
       depthWrite: false,
       side: THREE.DoubleSide,
     });
@@ -117,6 +174,7 @@ export class BulletSystem {
     this._mesh.frustumCulled = false;
     this._mesh.castShadow = false;
     this._mesh.receiveShadow = false;
+    this._mesh.layers.set(1); // exclude from outline pre-pass (layer 0 only)
     this._mesh.count = 0; // start with 0 visible instances
     scene.add(this._mesh);
   }
@@ -177,8 +235,13 @@ export class BulletSystem {
         this._collisionRay.far = step * 1.5; // slight lookahead
         const hits = this._collisionRay.intersectObjects(this.collidables, false);
         if (hits.length > 0) {
+          const hitNormal = hits[0].face.normal.clone()
+            .transformDirection(hits[0].object.matrixWorld).normalize();
           if (this.sparks) {
-            this.sparks.emit(hits[0].point, hits[0].face.normal, _dir);
+            this.sparks.emit(hits[0].point, hitNormal, _dir);
+          }
+          if (this.decals) {
+            this.decals.add(hits[0].point, hitNormal);
           }
           b.alive = false;
           continue;
@@ -204,7 +267,11 @@ export class BulletSystem {
     }
 
     // Sync uniforms
-    this._material.uniforms.uColor.value.copy(this.color);
+    this._material.uniforms.uShadow.value.copy(this.shadow);
+    this._material.uniforms.uMid.value.copy(this.mid);
+    this._material.uniforms.uHighlight.value.copy(this.highlight);
+    this._material.uniforms.uEmissive.value = this.emissive;
+    this._material.uniforms.uEdgeSoftness.value = this.edgeSoftness;
   }
 
   dispose() {

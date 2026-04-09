@@ -210,11 +210,16 @@ export class OutlinePass extends Pass {
     this._scene.fog = null;
     this._scene.overrideMaterial = this.normalMaterial;
 
+    // Restrict pre-pass to layer 0 only (excludes muzzle flash on layer 1)
+    const savedLayers = this._camera.layers.mask;
+    this._camera.layers.set(0);
+
     renderer.setRenderTarget(this.depthNormalRT);
     renderer.clear();
     renderer.render(this._scene, this._camera);
 
     // Restore
+    this._camera.layers.mask = savedLayers;
     this._scene.background = bg;
     this._scene.fog = fog;
     this._scene.overrideMaterial = overrideMat;

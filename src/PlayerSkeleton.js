@@ -106,6 +106,7 @@ export class PlayerSkeleton {
     this.hipLength   = opts.hipLength   ?? 0.6;
     this.legLength   = opts.legLength   ?? 0.8;
     this.spineHeight = opts.spineHeight ?? 0.70;
+    this._refSpineHeight = this.spineHeight; // fixed reference for raycast/climb proxies
 
     // Per-bone lengths: 4 spines, 6 hips (L0,R0,L1,R1,L2,R2), 6 legs (same order)
     this.spineLengths = [this.spineLength / 2, this.spineLength / 2, this.spineLength / 2, this.spineLength / 2];
@@ -120,7 +121,12 @@ export class PlayerSkeleton {
     this.group = new THREE.Group();
     this._boneMeshes = [];
     this._jointMeshes = [];
+    this._overrideMaterial = null;
     this.bones = {};
+
+    // Stored custom bone-local geometries (survives build() teardown)
+    // Map<boneName, { geometry, material, restLength }>
+    this._customGeoStore = null;
 
     // Per-limb IK data (filled by build)
     // Index layout: [L0, R0, L1, R1, L2, R2]
@@ -226,8 +232,31 @@ export class PlayerSkeleton {
     };
 
     // Joint spheres at the 5 spine nodes
+    this._spineNodeJoints = [];
     for (const n of this.nodes) {
-      this._addJoint(n);
+      this._spineNodeJoints.push(this._addJoint(n));
+    }
+  }
+
+  /**
+   * Re-position spine bone meshes and spine-node joint spheres to match
+   * the current `this.nodes` positions.  Must be called after setLiveHeight
+   * or any other modification to node Y so the visual bones stay connected
+   * to the IK hip roots.
+   */
+  updateSpine() {
+    // Spine bones: spine1 = node0→node1, spine2 = node1→node2, etc.
+    for (let i = 0; i < 4; i++) {
+      const bone = this.bones[`spine${i + 1}`];
+      if (bone) updateBoneMesh(bone.mesh, this.nodes[i], this.nodes[i + 1]);
+    }
+    // Spine-node joint spheres
+    if (this._spineNodeJoints) {
+      for (let i = 0; i < this.nodes.length; i++) {
+        if (this._spineNodeJoints[i]) {
+          this._spineNodeJoints[i].position.copy(this.nodes[i]);
+        }
+      }
     }
   }
 
@@ -327,7 +356,23 @@ export class PlayerSkeleton {
   }
 
   _addBone(from, to, mat, name) {
-    const mesh = createBoneMesh(from, to, mat);
+    let mesh;
+    const stored = this._customGeoStore && this._customGeoStore.get(name);
+    if (stored) {
+      // Re-use stored custom geometry (already in bone-local space)
+      mesh = new THREE.Mesh(stored.geometry.clone(), this._overrideMaterial || stored.material.clone());
+      mesh.castShadow = true;
+      mesh.userData.customGeo = true;
+      mesh.userData.restLength = stored.restLength;
+      // Position at "from", orient +Y toward "to"
+      mesh.position.copy(from);
+      const dir = new THREE.Vector3().subVectors(to, from);
+      if (dir.lengthSq() > 0.0001) {
+        mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+      }
+    } else {
+      mesh = createBoneMesh(from, to, this._overrideMaterial || mat);
+    }
     mesh.name = name;
     this.group.add(mesh);
     this._boneMeshes.push(mesh);
@@ -336,7 +381,7 @@ export class PlayerSkeleton {
 
   _addJoint(pos, mat) {
     const geo = new THREE.SphereGeometry(BONE_RADIUS * 2.5, 8, 6);
-    const mesh = new THREE.Mesh(geo, mat || jointMat);
+    const mesh = new THREE.Mesh(geo, this._overrideMaterial || mat || jointMat);
     mesh.position.copy(pos);
     mesh.castShadow = true;
     this.group.add(mesh);
@@ -352,39 +397,145 @@ export class PlayerSkeleton {
   }
 
   /**
+   * Replace the material on ALL bone and joint meshes.
+   * @param {THREE.Material} mat
+   */
+  setMaterial(mat) {
+    this._overrideMaterial = mat;
+    for (const m of this._boneMeshes) m.material = mat;
+    for (const m of this._jointMeshes) m.material = mat;
+  }
+
+  /**
+   * Dynamically adjust the spine height. Updates spineHeight (used for body-height
+   * tracking) AND all node Y positions so IK hip roots move accordingly.
+   * Does NOT touch _refSpineHeight.
+   * @param {number} y
+   */
+  setLiveHeight(y) {
+    this.spineHeight = y;
+    if (this.nodes) {
+      for (const n of this.nodes) n.y = y;
+      this.updateSpine();
+    }
+  }
+
+  /**
    * Replace default cylinder bone meshes with custom geometry from a loaded GLB.
-   * @param {Map<string, THREE.Mesh>} meshMap – name → mesh from SkeletonIO.loadCustomGeoGLB
+   *
+   * Incoming meshes (from loadCustomGeoGLB) have their geometry in skeleton-space
+   * (world transforms already baked in).  This method:
+   *   1. Computes each bone's local frame (origin at from, +Y toward to)
+   *   2. Applies the inverse to bring geometry into bone-local space
+   *   3. Stores the bone-local geometry so it survives build() teardowns
+   *
+   * @param {Map<string, THREE.Mesh>} meshMap – name → mesh from loadCustomGeoGLB
    */
   applyCustomGeo(meshMap) {
+    if (!this._customGeoStore) this._customGeoStore = new Map();
+
+    const _invBone  = new THREE.Matrix4();
+    const _boneQuat = new THREE.Quaternion();
+    const _up       = new THREE.Vector3(0, 1, 0);
+    const _dir      = new THREE.Vector3();
+    const _one      = new THREE.Vector3(1, 1, 1);
+
+    // Build a fuzzy lookup: Blender's GLTF export strips dots from
+    // .001 suffixes, turning "hip_L0.001" into "hip_L0001".  We match
+    // by checking if any meshMap key starts with the bone name and the
+    // remaining characters are all digits (the Blender collision suffix).
+    // We sort bone names longest-first so "gun_upper" matches before "gun".
+    const boneNames = Object.keys(this.bones).sort((a, b) => b.length - a.length);
+    const meshLookup = new Map(); // boneName → mesh from meshMap
+    const usedKeys = new Set();
+    for (const bn of boneNames) {
+      // Exact match first
+      if (meshMap.has(bn) && !usedKeys.has(bn)) {
+        meshLookup.set(bn, meshMap.get(bn));
+        usedKeys.add(bn);
+        continue;
+      }
+      // Prefix + digits match
+      for (const [key, mesh] of meshMap) {
+        if (usedKeys.has(key)) continue;
+        if (key.startsWith(bn)) {
+          const suffix = key.slice(bn.length);
+          if (/^\d{3,}$/.test(suffix)) {
+            meshLookup.set(bn, mesh);
+            usedKeys.add(key);
+            break;
+          }
+        }
+      }
+    }
+
+    const matched   = [];
+    const unmatched = [];
+
     for (const [name, bone] of Object.entries(this.bones)) {
-      const custom = meshMap.get(name);
-      if (!custom) continue;
+      const custom = meshLookup.get(name);
+      if (!custom) { unmatched.push(name); continue; }
+      matched.push(name);
 
       // Remove old mesh
       const oldMesh = bone.mesh;
       this.group.remove(oldMesh);
       if (oldMesh.geometry !== _sharedBoneGeo) oldMesh.geometry.dispose();
 
-      // Compute rest length from the current bone endpoints
-      const restLen = new THREE.Vector3().subVectors(bone.to, bone.from).length();
-      custom.userData.customGeo = true;
-      custom.userData.restLength = restLen;
+      // Rest length for this bone
+      const restLen = _dir.subVectors(bone.to, bone.from).length();
+      _dir.normalize();
+      _boneQuat.setFromUnitVectors(_up, _dir);
 
-      // Place it at the "from" point, oriented along from→to
-      custom.position.copy(bone.from);
-      const dir = new THREE.Vector3().subVectors(bone.to, bone.from).normalize();
-      if (dir.lengthSq() > 0.0001) {
-        custom.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
-      }
+      // Bone frame: position at from, +Y along direction
+      const boneMat = new THREE.Matrix4().compose(bone.from, _boneQuat, _one);
+      _invBone.copy(boneMat).invert();
 
-      this.group.add(custom);
-      bone.mesh = custom;
+      // Transform geometry from skeleton-space into bone-local space
+      const localGeo = custom.geometry.clone();
+      localGeo.applyMatrix4(_invBone);
 
-      // Also update limbData references
-      for (const ld of this.limbData) {
-        if (ld.hipBone === bone) ld.hipBone = bone;
-        if (ld.legBone === bone) ld.legBone = bone;
-      }
+      const material = this._overrideMaterial || custom.material.clone();
+      const newMesh = new THREE.Mesh(localGeo, material);
+      newMesh.name = name;
+      newMesh.castShadow = true;
+      newMesh.userData.customGeo = true;
+      newMesh.userData.restLength = restLen;
+
+      // Place at current bone position and orient
+      newMesh.position.copy(bone.from);
+      newMesh.quaternion.copy(_boneQuat);
+
+      this.group.add(newMesh);
+      bone.mesh = newMesh;
+
+      // Store bone-local data so build() can re-create this mesh
+      this._customGeoStore.set(name, {
+        geometry: localGeo.clone(),
+        material: custom.material.clone(),
+        restLength: restLen,
+      });
     }
+
+    console.log(`[Skeleton] Custom geo applied to ${matched.length} bones: ${matched.join(', ')}`);
+    if (unmatched.length > 0) {
+      console.warn(`[Skeleton] No custom mesh found for bones: ${unmatched.join(', ')}`);
+    }
+    const extras = [...meshMap.keys()].filter(k => !this.bones[k]);
+    if (extras.length > 0) {
+      console.warn(`[Skeleton] GLB meshes that didn't match any bone (ignored): ${extras.join(', ')}`);
+    }
+  }
+
+  /**
+   * Remove all stored custom geometry, reverting to default cylinders
+   * on the next build() call.
+   */
+  clearCustomGeo() {
+    if (this._customGeoStore) {
+      for (const v of this._customGeoStore.values()) v.geometry.dispose();
+      this._customGeoStore = null;
+    }
+    this.build();
   }
 }
