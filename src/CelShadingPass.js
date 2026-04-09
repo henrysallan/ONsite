@@ -70,7 +70,7 @@ export function defaultRampStops() {
     { position: 0.126,  color: [0.0, 0.0, 0.7] },
     { position: 0.262,  color: [0.2, 0.2, 0.85] },
     { position: 0.563, color: [1.0, 1.0, 1.0] },
-    { position: 1.0,  color: [0.2, 0.22d, 1.0] },
+    { position: 1.0,  color: [0.2, 0.22, 1.0] },
   ];
 }
 

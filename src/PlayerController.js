@@ -177,6 +177,8 @@ export class PlayerController {
     this._jump = null;     // null when grounded, { velocity: Vector3, airTime: number } when airborne
     this._jumpVelocity = new THREE.Vector3();
     this._jumpRequested = false; // set true on Space press, consumed on next update
+    this._jumpsUsed = 0;         // 0 on ground, incremented per jump (max 2 = double jump)
+    this._maxJumps = 2;          // 1 = single, 2 = double jump
     this.jumpStrength = 3.0;     // MAX upward velocity (Leva-tunable)
     this.jumpMinStrength = 1.5;  // tap jump velocity (Leva-tunable)
     this.jumpChargeRate = 25.0;  // velocity added per second while holding (Leva-tunable)
@@ -373,16 +375,27 @@ export class PlayerController {
     // Tick post-landing jump cooldown
     if (this._jumpCooldown > 0) this._jumpCooldown -= dt;
 
-    if (this._jumpRequested && !this._jump && !this._landing && this._jumpCooldown <= 0) {
-      this._jumpRequested = false;
-      // Cancel any active transition so we can jump off walls
-      if (this._transition) {
-        this._transition = null;
-        this.walk._inTransition = false;
+    if (this._jumpRequested && !this._landing && this._jumpCooldown <= 0) {
+      if (!this._jump) {
+        // ── First jump (from ground/wall) ──
+        this._jumpRequested = false;
+        // Cancel any active transition so we can jump off walls
+        if (this._transition) {
+          this._transition = null;
+          this.walk._inTransition = false;
+        }
+        this._launchJump();
+        this._jumpsUsed = 1;
+        this._jumpCharging = true;
+        this._jumpCharged = 0;
+      } else if (this._jumpsUsed < this._maxJumps) {
+        // ── Double jump (while airborne) ──
+        this._jumpRequested = false;
+        this._launchDoubleJump();
+        this._jumpsUsed++;
+        this._jumpCharging = true;
+        this._jumpCharged = 0;
       }
-      this._launchJump();
-      this._jumpCharging = true;
-      this._jumpCharged = 0;
     }
     this._jumpRequested = false; // consume even if we couldn't jump
 
@@ -452,7 +465,7 @@ export class PlayerController {
         _footTmp.copy(footLocal).applyMatrix4(_invSkelLocal);
         this.skeleton.updateLimb(i, _footTmp);
       }
-      this.skeleton.updateGunRest();
+      this.skeleton.updateGunRest(_invSkelLocal);
       return;
     }
 
@@ -685,7 +698,7 @@ export class PlayerController {
         _footTmp.copy(footLocal).applyMatrix4(_invSkelLocal);
         this.skeleton.updateLimb(i, _footTmp);
       }
-      this.skeleton.updateGunRest();
+      this.skeleton.updateGunRest(_invSkelLocal);
       return;
     }
 
@@ -930,7 +943,7 @@ export class PlayerController {
 
       this.skeleton.updateLimb(i, _footTmp);
     }
-    this.skeleton.updateGunRest();
+    this.skeleton.updateGunRest(_invSkelLocal);
 
     // ── Velocity clamp: prevent body launches ──
     // Cap total displacement this frame to maxBodySpeed * dt.
@@ -1013,6 +1026,55 @@ export class PlayerController {
       // Tuck target = 50% toward body center (in world space)
       const homeWorld = _tmpV3.copy(limb.home)
         .multiplyScalar(this.walk._hipScale * 0.3)  // pull in tight
+        .applyMatrix4(this.mesh.matrixWorld);
+      this._jumpTuckTargets[i].copy(homeWorld);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  JUMP — Double Jump (while airborne)
+  // ═══════════════════════════════════════════════════════════════════
+  /**
+   * Perform a second jump while already airborne.
+   * Direction = current horizontal velocity (the direction the player is
+   * already moving), plus an upward boost. If not moving horizontally,
+   * just boost straight up.
+   */
+  _launchDoubleJump() {
+    const vel = this._jumpVelocity;
+
+    // Horizontal direction from current velocity
+    const hx = vel.x;
+    const hz = vel.z;
+    const hSpeed = Math.sqrt(hx * hx + hz * hz);
+
+    // Reset velocity, then set the double-jump impulse
+    if (hSpeed > 0.01) {
+      // Maintain horizontal direction, boost to a consistent speed
+      const dirX = hx / hSpeed;
+      const dirZ = hz / hSpeed;
+      const boostH = Math.max(hSpeed, this.jumpMinStrength * 0.5);
+      vel.x = dirX * boostH;
+      vel.z = dirZ * boostH;
+    }
+    // else: keep whatever (near-zero) horizontal vel there is
+
+    // Fresh upward impulse — slightly weaker than the first jump
+    vel.y = this.jumpMinStrength * 0.85;
+
+    // Reset fall/tuck timers so spine height management restarts cleanly
+    this._fallTime = 0;
+    this._fallPrepTimer = 0;
+
+    // Reset air time so latch grace period re-applies
+    this._jump.airTime = 0;
+
+    // Re-tuck legs from current positions
+    this.mesh.updateMatrixWorld(true);
+    for (let i = 0; i < 6; i++) {
+      const limb = this.walk.limbs[i];
+      const homeWorld = _tmpV3.copy(limb.home)
+        .multiplyScalar(this.walk._hipScale * 0.3)
         .applyMatrix4(this.mesh.matrixWorld);
       this._jumpTuckTargets[i].copy(homeWorld);
     }
@@ -1240,7 +1302,7 @@ export class PlayerController {
       _footTmp.applyMatrix4(_invSkelLocal);
       this.skeleton.updateLimb(i, _footTmp);
     }
-    this.skeleton.updateGunRest();
+    this.skeleton.updateGunRest(_invSkelLocal);
   }
 
   /**
@@ -1434,7 +1496,7 @@ export class PlayerController {
       _footTmp.applyMatrix4(_invSkelLocal);
       this.skeleton.updateLimb(i, _footTmp);
     }
-    this.skeleton.updateGunRest();
+    this.skeleton.updateGunRest(_invSkelLocal);
 
     if (t >= 1) {
       // Landing complete — finalize state
@@ -1458,6 +1520,7 @@ export class PlayerController {
       // compound into extreme speed.  Ground landings have no cooldown
       // so the creature still feels responsive on flat terrain.
       this._jumpCooldown = L.isClimb ? 0.1 : 0;
+      this._jumpsUsed = 0;
       this._landing = null;
 
       // Begin landing squash from resting height (landing interpolation

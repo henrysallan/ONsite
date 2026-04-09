@@ -31,6 +31,20 @@ const _poleHint = new THREE.Vector3();
 const _toFoot = new THREE.Vector3();
 const _knee = new THREE.Vector3();
 
+// Extra temporaries for roll-stable bone orientation
+const _boneRight = new THREE.Vector3();
+const _boneFwd   = new THREE.Vector3();
+const _boneMat3  = new THREE.Matrix4();
+
+// Temporaries for gun arm counter-rotation
+const _gunOffset   = new THREE.Vector3();
+const _invSkelQuat = new THREE.Quaternion();
+const _gunEuler    = new THREE.Euler();
+const _gunSegQuat  = new THREE.Quaternion();
+const _gunLowerOff = new THREE.Vector3();
+const _gunAimLocal = new THREE.Vector3();
+const _invGroupMat = new THREE.Matrix4();
+
 // Shared materials
 const spineMat  = new THREE.MeshStandardMaterial({ color: 0xffffff });
 const hipMat    = new THREE.MeshStandardMaterial({ color: 0xffffff });
@@ -42,6 +56,45 @@ const gunMat    = new THREE.MeshStandardMaterial({ color: 0xffffff });
 // Reusable temporary for gun limb rest-pose target
 const _gunTarget = new THREE.Vector3();
 
+/**
+ * Build a roll-stable quaternion that orients local +Y along `dir`,
+ * using `ref` as a secondary reference to lock the twist (roll) axis.
+ *
+ * When `dir` is nearly parallel to `ref`, falls back to a perpendicular
+ * reference so the cross products stay well-conditioned.
+ *
+ * The resulting basis is:
+ *   Y = dir  (bone long axis)
+ *   X = normalize(cross(dir, ref))   — "right"
+ *   Z = normalize(cross(X, dir))     — "forward"
+ */
+function stableOrient(quat, dir, ref) {
+  // Choose a reference that isn't parallel to dir
+  const dot = Math.abs(dir.dot(ref));
+  if (dot > 0.99) {
+    // ref is nearly parallel — pick a perpendicular fallback
+    _boneFwd.set(0, 0, 1);
+    if (Math.abs(dir.dot(_boneFwd)) > 0.99) _boneFwd.set(1, 0, 0);
+  } else {
+    _boneFwd.copy(ref);
+  }
+
+  // Right = dir × ref  (perpendicular to bone in the reference plane)
+  _boneRight.crossVectors(dir, _boneFwd).normalize();
+  // Forward = right × dir  (completes the orthonormal basis)
+  _boneFwd.crossVectors(_boneRight, dir).normalize();
+
+  // Build a rotation matrix from the three basis columns:
+  //   col0 = right (X), col1 = dir (Y), col2 = forward (Z)
+  const e = _boneMat3.elements;
+  e[0] = _boneRight.x; e[4] = dir.x; e[8]  = _boneFwd.x; e[12] = 0;
+  e[1] = _boneRight.y; e[5] = dir.y; e[9]  = _boneFwd.y; e[13] = 0;
+  e[2] = _boneRight.z; e[6] = dir.z; e[10] = _boneFwd.z; e[14] = 0;
+  e[3] = 0;            e[7] = 0;     e[11] = 0;           e[15] = 1;
+
+  quat.setFromRotationMatrix(_boneMat3);
+}
+
 /** Create a tube (cylinder) mesh between two local-space points. */
 function createBoneMesh(from, to, material) {
   const dir = new THREE.Vector3().subVectors(to, from);
@@ -52,9 +105,10 @@ function createBoneMesh(from, to, material) {
   mesh.position.copy(mid);
   mesh.scale.set(1, length, 1);
 
-  const up = new THREE.Vector3(0, 1, 0);
-  const quat = new THREE.Quaternion().setFromUnitVectors(up, dir.clone().normalize());
-  mesh.quaternion.copy(quat);
+  if (length > 0.0001) {
+    const d = dir.normalize();
+    stableOrient(mesh.quaternion, d, _boneUp.set(0, 0, 1));
+  }
 
   mesh.castShadow = true;
   return mesh;
@@ -68,11 +122,10 @@ function updateBoneMesh(mesh, from, to) {
   if (mesh.userData.customGeo) {
     // Custom geometry: origin is at "from", extends along local +Y.
     mesh.position.copy(from);
-    _boneUp.set(0, 1, 0);
     const dirSq = _boneDir.lengthSq();
     if (dirSq > 0.0001) {
       _boneDir.multiplyScalar(1 / Math.sqrt(dirSq));
-      mesh.quaternion.setFromUnitVectors(_boneUp, _boneDir);
+      stableOrient(mesh.quaternion, _boneDir, _boneUp.set(0, 0, 1));
     }
     const restLen = mesh.userData.restLength || length;
     mesh.scale.set(1, length / restLen, 1);
@@ -82,11 +135,10 @@ function updateBoneMesh(mesh, from, to) {
     mesh.position.copy(_boneMid);
     mesh.scale.set(1, length, 1);
 
-    _boneUp.set(0, 1, 0);
     const dirSq = _boneDir.lengthSq();
     if (dirSq > 0.0001) {
       _boneDir.multiplyScalar(1 / Math.sqrt(dirSq));
-      mesh.quaternion.setFromUnitVectors(_boneUp, _boneDir);
+      stableOrient(mesh.quaternion, _boneDir, _boneUp.set(0, 0, 1));
     }
   }
 }
@@ -116,7 +168,16 @@ export class PlayerSkeleton {
     // Gun limb lengths (upper extends up from spine, lower bends forward)
     this.gunUpperLength = opts.gunUpperLength ?? 0.6;
     this.gunLowerLength = opts.gunLowerLength ?? 0.5;
-    this.gunUpperAngle  = opts.gunUpperAngle  ?? 30; // degrees from vertical toward forward
+    this.gunUpperAngle  = opts.gunUpperAngle  ?? 30; // legacy (unused if per-segment rots are set)
+
+    // Per-segment rotation (degrees) — Euler XYZ around each segment's base
+    this.gunUpperRot = { x: 0, y: 0, z: 0 };
+    this.gunLowerRot = { x: 0, y: 0, z: 0 };
+
+    // Aim tracking: when set, the lower gun segment points along this
+    // world-space direction instead of using gunLowerRot.
+    this._gunAimDirWorld = null;  // THREE.Vector3 or null
+    this._gunAimBlend = 0;        // smooth 0→1 blend toward aim
 
     this.group = new THREE.Group();
     this._boneMeshes = [];
@@ -236,6 +297,9 @@ export class PlayerSkeleton {
     for (const n of this.nodes) {
       this._spineNodeJoints.push(this._addJoint(n));
     }
+
+    // Re-hide default geometry if custom geo was previously applied
+    this._applyCustomGeoVisibility();
   }
 
   /**
@@ -326,18 +390,81 @@ export class PlayerSkeleton {
   }
 
   /**
-   * Update the gun limb to its default rest pose (extends up, bends forward).
-   * Call once per frame after updating walking limbs.
+   * Set or clear the world-space aim direction for the gun.
+   * While set, the lower gun segment blends toward this direction.
+   * @param {THREE.Vector3|null} dirWorld — normalised world-space aim direction, or null to release
+   * @param {number} dt — delta time for smooth blending
+   * @param {number} [blendSpeed=12] — how fast to blend in/out
    */
-  updateGunRest() {
+  setGunAim(dirWorld, dt, blendSpeed = 12) {
+    if (dirWorld) {
+      if (!this._gunAimDirWorld) this._gunAimDirWorld = new THREE.Vector3();
+      this._gunAimDirWorld.copy(dirWorld);
+      this._gunAimBlend = Math.min(1, this._gunAimBlend + blendSpeed * dt);
+    } else {
+      this._gunAimBlend = Math.max(0, this._gunAimBlend - blendSpeed * dt);
+      if (this._gunAimBlend <= 0) this._gunAimDirWorld = null;
+    }
+  }
+
+  /**
+   * Update the gun limb to its rest pose using per-segment Euler rotations.
+   *
+   * Upper segment: starts pointing +Y (up) from spine root, rotated by gunUpperRot.
+   * Lower segment: continues in the upper's end direction, further rotated by gunLowerRot.
+   * When firing (gunAimBlend > 0), the lower segment blends toward the aim direction.
+   *
+   * @param {THREE.Matrix4} [invSkelMatrix] — inverse of skeleton.group.matrix.
+   *   Counter-rotates offsets so the gun holds a world-stable direction
+   *   despite the skeleton group's noise rotation.
+   */
+  updateGunRest(invSkelMatrix) {
     if (!this.gunData) return;
     const root = this.nodes[this.gunData.nodeIndex];
-    const totalReach = this.gunUpperLength + this.gunLowerLength;
-    // Upper limb direction: angle from vertical (+Y) toward forward (+Z)
-    const rad = this.gunUpperAngle * Math.PI / 180;
-    const upComp = Math.cos(rad) * totalReach * 0.7;
-    const fwdComp = Math.sin(rad) * totalReach * 0.7 + totalReach * 0.3;
-    _gunTarget.set(root.x, root.y + upComp, root.z + fwdComp);
+    const ur = this.gunUpperRot;
+    const lr = this.gunLowerRot;
+    const deg = Math.PI / 180;
+
+    // Upper segment quaternion (rotates the +Y base direction)
+    _gunEuler.set(ur.x * deg, ur.y * deg, ur.z * deg);
+    _gunSegQuat.setFromEuler(_gunEuler);
+
+    // Upper offset: +Y * upperLength, rotated by upper Euler
+    _gunOffset.set(0, this.gunUpperLength, 0).applyQuaternion(_gunSegQuat);
+
+    // Lower segment (rest pose): cumulative rotation (upper * lower)
+    _gunEuler.set(lr.x * deg, lr.y * deg, lr.z * deg);
+    _gunSegQuat.multiply(new THREE.Quaternion().setFromEuler(_gunEuler));
+    _gunLowerOff.set(0, this.gunLowerLength, 0).applyQuaternion(_gunSegQuat);
+
+    if (invSkelMatrix) {
+      // Counter-rotate both offsets so they stay world-stable
+      _invSkelQuat.setFromRotationMatrix(invSkelMatrix);
+      _gunOffset.applyQuaternion(_invSkelQuat);
+      _gunLowerOff.applyQuaternion(_invSkelQuat);
+    }
+
+    // ── Aim blend: replace lower offset with aim direction ──
+    if (this._gunAimBlend > 0 && this._gunAimDirWorld) {
+      // Convert world-space aim direction into skeleton-local space
+      // skeleton-local = invSkelMatrix * invGroupParent, but skeleton group
+      // is a child of the body mesh, so we need the full inverse chain.
+      // group.matrixWorld gets us from skeleton-local → world, so invert that.
+      _invGroupMat.copy(this.group.matrixWorld).invert();
+      _gunAimLocal.copy(this._gunAimDirWorld)
+        .transformDirection(_invGroupMat)  // world dir → skeleton-local dir
+        .normalize();
+
+      // Aim-derived lower offset: aim direction * lower length
+      const aimLowerOff = _gunAimLocal.multiplyScalar(this.gunLowerLength);
+
+      // Blend between rest lower offset and aim lower offset
+      const b = this._gunAimBlend;
+      _gunLowerOff.lerp(aimLowerOff, b);
+    }
+
+    // Tip = root + upper offset + lower offset
+    _gunTarget.copy(root).add(_gunOffset).add(_gunLowerOff);
     this.updateGunLimb(_gunTarget);
   }
 
@@ -368,7 +495,8 @@ export class PlayerSkeleton {
       mesh.position.copy(from);
       const dir = new THREE.Vector3().subVectors(to, from);
       if (dir.lengthSq() > 0.0001) {
-        mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+        dir.normalize();
+        stableOrient(mesh.quaternion, dir, _boneUp.set(0, 0, 1));
       }
     } else {
       mesh = createBoneMesh(from, to, this._overrideMaterial || mat);
@@ -436,7 +564,7 @@ export class PlayerSkeleton {
 
     const _invBone  = new THREE.Matrix4();
     const _boneQuat = new THREE.Quaternion();
-    const _up       = new THREE.Vector3(0, 1, 0);
+    const _ref      = new THREE.Vector3(0, 0, 1); // must match updateBoneMesh reference
     const _dir      = new THREE.Vector3();
     const _one      = new THREE.Vector3(1, 1, 1);
 
@@ -485,7 +613,7 @@ export class PlayerSkeleton {
       // Rest length for this bone
       const restLen = _dir.subVectors(bone.to, bone.from).length();
       _dir.normalize();
-      _boneQuat.setFromUnitVectors(_up, _dir);
+      stableOrient(_boneQuat, _dir, _ref);
 
       // Bone frame: position at from, +Y along direction
       const boneMat = new THREE.Matrix4().compose(bone.from, _boneQuat, _one);
@@ -525,6 +653,30 @@ export class PlayerSkeleton {
     if (extras.length > 0) {
       console.warn(`[Skeleton] GLB meshes that didn't match any bone (ignored): ${extras.join(', ')}`);
     }
+
+    // Hide default geometry that wasn't replaced by custom meshes
+    this._hasCustomGeo = true;
+    this._applyCustomGeoVisibility();
+  }
+
+  /**
+   * Hide joint spheres and unmatched default bone cylinders when custom
+   * geometry is active. Called after applyCustomGeo and after build().
+   */
+  _applyCustomGeoVisibility() {
+    if (!this._hasCustomGeo) return;
+
+    // Hide all joint spheres (knees, feet, spine nodes)
+    for (const j of this._jointMeshes) {
+      j.visible = false;
+    }
+
+    // Hide default bone cylinders that have no custom replacement
+    for (const b of this._boneMeshes) {
+      if (!b.userData.customGeo) {
+        b.visible = false;
+      }
+    }
   }
 
   /**
@@ -532,6 +684,7 @@ export class PlayerSkeleton {
    * on the next build() call.
    */
   clearCustomGeo() {
+    this._hasCustomGeo = false;
     if (this._customGeoStore) {
       for (const v of this._customGeoStore.values()) v.geometry.dispose();
       this._customGeoStore = null;

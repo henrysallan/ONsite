@@ -589,6 +589,30 @@ function animate() {
   const dt = Math.min(clock.getDelta(), 0.05);
 
   rayLogger.beginFrame(dt);
+
+  // ── Gun aim tracking: feed aim direction to skeleton before update ──
+  // We intentionally do NOT call updateMatrixWorld here — that would bake
+  // stale skeleton group transforms and prevent player.update() from
+  // resetting rotation during jumps. The gun tip from last frame is close
+  // enough for a smooth aim direction.
+  {
+    const isShooting = _firing && !_gunOverheated;
+    if (isShooting) {
+      _aimRaycaster.setFromCamera(_screenCenter, camera);
+      const hits = _aimRaycaster.intersectObjects(groundMeshes, false);
+      if (hits.length > 0) {
+        _aimPoint.copy(hits[0].point);
+      } else {
+        _aimPoint.copy(_aimRaycaster.ray.direction).multiplyScalar(200).add(_aimRaycaster.ray.origin);
+      }
+      // Use last-frame gun tip (already computed after previous player.update)
+      _aimDir.subVectors(_aimPoint, _gunTipW).normalize();
+      player.skeleton.setGunAim(_aimDir, dt);
+    } else {
+      player.skeleton.setGunAim(null, dt);
+    }
+  }
+
   player.update(dt);
 
   // Sync light direction to bullet shader
@@ -1147,7 +1171,18 @@ function LevaPanel() {
   const gunCtrl = useControls('Gun Limb', {
     'Upper Length': { value: 0.6, min: 0.1, max: 3.0, step: 0.05 },
     'Lower Length': { value: 0.5, min: 0.1, max: 3.0, step: 0.05 },
-    'Upper Angle':  { value: 30, min: -90, max: 90, step: 1 },
+  });
+
+  const gunUpperRot = useControls('Gun Upper Rotation', {
+    'X': { value: 0, min: -180, max: 180, step: 1 },
+    'Y': { value: 0, min: -180, max: 180, step: 1 },
+    'Z': { value: 0, min: -180, max: 180, step: 1 },
+  });
+
+  const gunLowerRot = useControls('Gun Lower Rotation', {
+    'X': { value: 92, min: -180, max: 180, step: 1 },
+    'Y': { value: 0, min: -180, max: 180, step: 1 },
+    'Z': { value: 0, min: -180, max: 180, step: 1 },
   });
 
   useEffect(() => {
@@ -1157,8 +1192,16 @@ function LevaPanel() {
   }, [gunCtrl['Upper Length'], gunCtrl['Lower Length']]);
 
   useEffect(() => {
-    skel.gunUpperAngle = gunCtrl['Upper Angle'];
-  }, [gunCtrl['Upper Angle']]);
+    skel.gunUpperRot.x = gunUpperRot['X'];
+    skel.gunUpperRot.y = gunUpperRot['Y'];
+    skel.gunUpperRot.z = gunUpperRot['Z'];
+  }, [gunUpperRot['X'], gunUpperRot['Y'], gunUpperRot['Z']]);
+
+  useEffect(() => {
+    skel.gunLowerRot.x = gunLowerRot['X'];
+    skel.gunLowerRot.y = gunLowerRot['Y'];
+    skel.gunLowerRot.z = gunLowerRot['Z'];
+  }, [gunLowerRot['X'], gunLowerRot['Y'], gunLowerRot['Z']]);
 
   // ── Hip bones ──
   const hips = useControls('Hip Bones', {
