@@ -51,6 +51,8 @@ const RAY_COLORS = {
   foot_place_out:    0x886622,
   surface_probe:     0xaaaa44,
   width_probe:       0x4466aa,
+  aim_ray:           0xff0000,
+  bullet_path:       0xffaa00,
 };
 
 const RAY_LABELS = {
@@ -74,12 +76,15 @@ const RAY_LABELS = {
   foot_place_out:    'Foot Out Fallback',
   surface_probe:     'Surface Probe',
   width_probe:       'Width Probe',
+  aim_ray:           'Aim Ray',
+  bullet_path:       'Bullet Path',
 };
 
 // ── Pool management ──
 const MAX_LINES = 256;          // max simultaneous visible rays
 const MAX_LOG_ENTRIES = 5000;   // circular log buffer size
 const RAY_LIFETIME = 0.15;     // seconds a ray stays visible after being logged
+const AIM_RAY_LIFETIME = 0.5; // longer lifetime for aim/bullet rays
 
 function makePoolLine() {
   const geo = new THREE.BufferGeometry();
@@ -249,7 +254,9 @@ export class RayDebugLogger {
       line.material.color.setHex(color);
       line.material.opacity = hit ? 0.85 : 0.35;
       line.visible = true;
-      this._poolMeta[idx] = { expiry: this._time + RAY_LIFETIME, category };
+      const lifetime = (category === 'aim_ray' || category === 'bullet_path')
+        ? AIM_RAY_LIFETIME : RAY_LIFETIME;
+      this._poolMeta[idx] = { expiry: this._time + lifetime, category };
 
       // Hit sphere
       if (hit && hitPoint) {

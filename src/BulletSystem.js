@@ -116,6 +116,7 @@ export class BulletSystem {
     this.scene = scene;
     this.collidables = collidables; // meshes to collide against
     this.sparks = null; // set to a SparkSystem instance to emit on hit
+    this.targetSystem = null; // set to a TargetSystem instance for target hits
 
     // ── Tunables (set from Leva) ──
     this.speed      = 60;    // units/sec
@@ -224,13 +225,13 @@ export class BulletSystem {
         continue;
       }
 
-      // Move
-      b.pos.addScaledVector(b.vel, dt);
+      // Collision: raycast from CURRENT position BEFORE moving,
+      // covering the full step distance. This prevents thin objects
+      // (like target discs) from being skipped over.
+      const step = b.vel.length() * dt;
+      _dir.copy(b.vel).normalize();
 
-      // Collision: raycast a short segment along velocity
       if (this.collidables.length > 0) {
-        const step = b.vel.length() * dt;
-        _dir.copy(b.vel).normalize();
         this._collisionRay.set(b.pos, _dir);
         this._collisionRay.far = step * 1.5; // slight lookahead
         const hits = this._collisionRay.intersectObjects(this.collidables, false);
@@ -247,6 +248,19 @@ export class BulletSystem {
           continue;
         }
       }
+
+      // Target collision
+      if (this.targetSystem) {
+        const result = this.targetSystem.testBulletRay(b.pos, _dir, step * 1.5);
+        if (result.hit) {
+          if (this.sparks) this.sparks.emit(result.point, result.normal, _dir);
+          b.alive = false;
+          continue;
+        }
+      }
+
+      // Move (after collision checks pass)
+      b.pos.addScaledVector(b.vel, dt);
 
       // Build instance matrix: translate + orient + scale
       _dir.copy(b.vel).normalize();

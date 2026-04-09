@@ -23,6 +23,7 @@ import { BulletSystem } from './BulletSystem.js';
 import { SparkSystem } from './SparkSystem.js';
 import { MuzzleFlash } from './MuzzleFlash.js';
 import { DecalSystem } from './DecalSystem.js';
+import { TargetSystem } from './TargetSystem.js';
 
 // ───────────────────────────────────────────────
 // Three.js setup (module-level singletons)
@@ -236,7 +237,7 @@ const wallMat = celMats.environment;
   dracoLoader.setDecoderPath('/draco/');
   const loader = new GLTFLoader();
   loader.setDRACOLoader(dracoLoader);
-  loader.load('public/meshes/testblock.glb', (gltf) => {
+  loader.load('/meshes/testblock.glb', (gltf) => {
     const model = gltf.scene;
     model.position.set(0, 0, 5);
     model.traverse((child) => {
@@ -276,6 +277,30 @@ bullets.sparks = sparks;
 const decals = new DecalSystem(scene);
 bullets.decals = decals;
 const muzzleFlash = new MuzzleFlash(scene);
+
+// ── Target system ──
+const targetMat = new CelMaterial({
+  shadow: '#003300', mid: '#00cc44', highlight: '#44ff88',
+  threshold1: 0.20, threshold2: 0.55,
+});
+const targets = new TargetSystem(scene, targetMat);
+bullets.targetSystem = targets;
+
+// Scatter targets around the map
+{
+  const targetPositions = [];
+  const count = 12;
+  for (let i = 0; i < count; i++) {
+    const angle = (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.4;
+    const dist = 12 + Math.random() * 30;
+    targetPositions.push(new THREE.Vector3(
+      Math.cos(angle) * dist,
+      1.0 + Math.random() * 2.0, // floating height
+      Math.sin(angle) * dist,
+    ));
+  }
+  targets.spawn(targetPositions);
+}
 const _aimRaycaster = new THREE.Raycaster();
 const _aimDir = new THREE.Vector3();
 const _gunTipW = new THREE.Vector3();
@@ -373,15 +398,33 @@ function _stopGunSound() {
 }
 
 function fireBullet() {
-  // 1. Raycast from camera through screen center to find aim point
+  // 1. Raycast from the FINAL camera (with post-offset) through screen centre.
+  //    This matches what the crosshair is pointing at.
+  //    Force matrix recompose so position/quaternion changes from camCtrl.update()
+  //    are baked into matrixWorld before setFromCamera reads it.
+  camera.updateMatrix();
+  camera.updateMatrixWorld(true);
+  camera.updateProjectionMatrix();
   _aimRaycaster.setFromCamera(_screenCenter, camera);
   _aimRaycaster.far = 500;
-  const hits = _aimRaycaster.intersectObjects(groundMeshes, false);
+
+  // Test against BOTH environment meshes and target meshes so the aim point
+  // lands on whatever the crosshair is actually pointing at.
+  const aimObjects = [...groundMeshes, ...targets._hitMeshes];
+  const hits = _aimRaycaster.intersectObjects(aimObjects, false);
   if (hits.length > 0) {
     _aimPoint.copy(hits[0].point);
   } else {
     _aimPoint.copy(_aimRaycaster.ray.direction).multiplyScalar(200).add(_aimRaycaster.ray.origin);
   }
+
+  // Debug: log aim ray (camera → aim point)
+  const aimOrigin = _aimRaycaster.ray.origin.clone();
+  const aimDirection = _aimRaycaster.ray.direction.clone();
+  const aimHit = hits.length > 0;
+  const aimHitDist = aimHit ? hits[0].distance : null;
+  rayLogger.log('aim_ray', aimOrigin, aimDirection, 500, aimHit,
+    aimHit ? hits[0].point : null, null, aimHit ? hits[0].object.name : null, aimHitDist);
 
   // 2. Get gun tip in world space
   player.skeleton.group.updateMatrixWorld(true);
@@ -389,6 +432,11 @@ function fireBullet() {
 
   // 3. Direction from gun tip toward aim point
   _aimDir.subVectors(_aimPoint, _gunTipW).normalize();
+
+  // Debug: log bullet path (gun tip → aim point)
+  const bulletDist = _gunTipW.distanceTo(_aimPoint);
+  rayLogger.log('bullet_path', _gunTipW.clone(), _aimDir.clone(), bulletDist, aimHit,
+    _aimPoint.clone(), null, null, bulletDist);
 
   // 4. Fire!
   bullets.fire(_gunTipW, _aimDir);
@@ -518,6 +566,52 @@ function animate() {
   // Sync light direction to bullet shader
   bullets._material.uniforms.uLightDir.value.copy(dirLight.position).normalize();
 
+  // Muzzle flash: update position to gun tip every frame
+  player.skeleton.group.updateMatrixWorld(true);
+  player.skeleton.getGunTipWorld(_gunTipW);
+  // Barrel direction: from gun elbow joint toward tip (in world space)
+  const _elbowW = player.skeleton.gunData.elbowJoint.position.clone();
+  player.skeleton.group.localToWorld(_elbowW);
+  _aimDir.subVectors(_gunTipW, _elbowW).normalize();
+  muzzleFlash.update(dt, _gunTipW, _aimDir);
+
+  climbDebug.update(player.walk, player.mesh.position);
+
+  // FOV lerp: stationary ↔ walking ↔ jumping (must run before camCtrl.update + fireBullet)
+  {
+    const isWalking = (player._jump == null && !player._landing &&
+      player.walk.inputDir.lengthSq() > 0.001) ? 1 : 0;
+    _currentFovBlend += (isWalking - _currentFovBlend) * (1 - Math.exp(-_fovLerpSpeed * dt));
+    if (!isWalking && _currentFovBlend < 0.001) _currentFovBlend = 0;
+    if (isWalking && _currentFovBlend > 0.999) _currentFovBlend = 1;
+
+    const isAirborne = player._jump != null ? 1 : 0;
+    const jumpBlendSpeed = isAirborne ? 3.0 : 6.0;
+    _currentJumpFovBlend += (isAirborne - _currentJumpFovBlend) * (1 - Math.exp(-jumpBlendSpeed * dt));
+    if (!isAirborne && _currentJumpFovBlend < 0.001) _currentJumpFovBlend = 0;
+  }
+
+  // Shoot camera lerp: offset Z + FOV (must run before camCtrl.update + fireBullet)
+  {
+    const isShooting = (_firing && !_gunOverheated) ? 1 : 0;
+    _currentShootBlend += (isShooting - _currentShootBlend) * (1 - Math.exp(-_shootLerpSpeed * dt));
+    if (!isShooting && _currentShootBlend < 0.001) _currentShootBlend = 0;
+
+    let baseFOV = _fovStationary + (_fovWalking - _fovStationary) * _currentFovBlend;
+    baseFOV = baseFOV + (_fovJumping - baseFOV) * _currentJumpFovBlend;
+
+    if (_currentShootBlend > 0.001) {
+      camCtrl.offsetZ = camCtrl._baseOffsetZ + (_shootOffsetZ - camCtrl._baseOffsetZ) * _currentShootBlend;
+      camera.fov = baseFOV + (_shootFOV - baseFOV) * _currentShootBlend;
+    } else {
+      camCtrl.offsetZ = camCtrl._baseOffsetZ;
+      camera.fov = baseFOV;
+    }
+    camera.updateProjectionMatrix();
+  }
+
+  camCtrl.update();
+
   // Gun heat: recharge when not firing (after delay)
   if (_firing && !_gunOverheated) {
     _gunRechargeWait = _gunRechargeDelay;
@@ -546,18 +640,7 @@ function animate() {
 
   bullets.update(dt);
   sparks.update(dt);
-
-  // Muzzle flash: update position to gun tip every frame
-  player.skeleton.group.updateMatrixWorld(true);
-  player.skeleton.getGunTipWorld(_gunTipW);
-  // Barrel direction: from gun elbow joint toward tip (in world space)
-  const _elbowW = player.skeleton.gunData.elbowJoint.position.clone();
-  player.skeleton.group.localToWorld(_elbowW);
-  _aimDir.subVectors(_gunTipW, _elbowW).normalize();
-  muzzleFlash.update(dt, _gunTipW, _aimDir);
-
-  climbDebug.update(player.walk, player.mesh.position);
-  camCtrl.update();
+  targets.update(dt);
 
   // Airborne camera wobble
   {
@@ -644,44 +727,7 @@ function animate() {
     }
   }
 
-  // FOV lerp: stationary ↔ walking ↔ jumping
-  {
-    const isWalking = (player._jump == null && !player._landing &&
-      player.walk.inputDir.lengthSq() > 0.001) ? 1 : 0;
-    _currentFovBlend += (isWalking - _currentFovBlend) * (1 - Math.exp(-_fovLerpSpeed * dt));
-    if (!isWalking && _currentFovBlend < 0.001) _currentFovBlend = 0;
-    if (isWalking && _currentFovBlend > 0.999) _currentFovBlend = 1;
-
-    const isAirborne = player._jump != null ? 1 : 0;
-    const jumpBlendSpeed = isAirborne ? 3.0 : 6.0; // slower in, faster out
-    _currentJumpFovBlend += (isAirborne - _currentJumpFovBlend) * (1 - Math.exp(-jumpBlendSpeed * dt));
-    if (!isAirborne && _currentJumpFovBlend < 0.001) _currentJumpFovBlend = 0;
-  }
-
-  // Shoot camera lerp: offset Z + FOV
-  {
-    const isShooting = (_firing && !_gunOverheated) ? 1 : 0;
-    _currentShootBlend += (isShooting - _currentShootBlend) * (1 - Math.exp(-_shootLerpSpeed * dt));
-    // Snap to 0 when close enough to avoid permanently overriding base values
-    if (!isShooting && _currentShootBlend < 0.001) _currentShootBlend = 0;
-
-    // Dynamic base FOV: stationary → walking, then layer jump on top
-    let baseFOV = _fovStationary + (_fovWalking - _fovStationary) * _currentFovBlend;
-    baseFOV = baseFOV + (_fovJumping - baseFOV) * _currentJumpFovBlend;
-
-    if (_currentShootBlend > 0.001) {
-      // Lerp offset Z: interpolate between the Leva default and shoot target
-      camCtrl.offsetZ = camCtrl._baseOffsetZ + (_shootOffsetZ - camCtrl._baseOffsetZ) * _currentShootBlend;
-      // Lerp FOV: from dynamic base toward shoot FOV
-      camera.fov = baseFOV + (_shootFOV - baseFOV) * _currentShootBlend;
-      camera.updateProjectionMatrix();
-    } else {
-      // Restore base offset Z, apply walk-lerped FOV
-      camCtrl.offsetZ = camCtrl._baseOffsetZ;
-      camera.fov = baseFOV;
-      camera.updateProjectionMatrix();
-    }
-  }
+  // FOV lerp and shoot camera lerp are now computed before camCtrl.update()
 
   // HUD parallax: offset based on camera world-space velocity
   if (_hudParallaxInited && dt > 0) {
